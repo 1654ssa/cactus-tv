@@ -31,7 +31,7 @@ async function fetchRedirectSafe(provider: Provider, url: URL, request: Request)
   let current = url;
   for (let i = 0; i < 4; i++) {
     assertMediaUrl(provider, current.toString());
-    const headers = new Headers({ Accept: '*/*', 'User-Agent': 'CactusTV/0.2', ...provider.requestHeaders });
+    const headers = new Headers({ Accept: '*/*', 'User-Agent': 'CactusTV/0.4', ...provider.requestHeaders });
     const range = request.headers.get('range'); if (range) headers.set('range', range);
     const response = await fetchWithTimeout(current.toString(), { headers, redirect: 'manual' }, 15_000);
     if (![301, 302, 303, 307, 308].includes(response.status)) return response;
