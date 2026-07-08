@@ -464,8 +464,7 @@ footer { display: flex; justify-content: space-between; gap: 30px; width: calc(1
   .home-sections { margin-top: -48px; padding-bottom: 28px; }
   .catalog-section {
     margin-bottom: 25px;
-    content-visibility: auto;
-    contain-intrinsic-size: 260px;
+    content-visibility: visible;
   }
   .section-heading { padding: 0 var(--page-pad); margin-bottom: 8px; }
   .section-heading h2 { font-size: 20px; }
@@ -482,7 +481,7 @@ footer { display: flex; justify-content: space-between; gap: 30px; width: calc(1
     border-radius: 5px;
     background: transparent;
     transition: none;
-    contain: layout paint style;
+    contain: none;
   }
   .media-card:hover { transform: none; box-shadow: none; }
   .poster { aspect-ratio: 2/3; border-radius: 5px; }
