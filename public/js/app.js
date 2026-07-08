@@ -19,22 +19,24 @@ let currentView = 'home';
 let settings = store.settings();
 let currentPlayback = null;
 let featuredItem = null;
+let activeSearchController = null;
+let searchSequence = 0;
 
 els.historyToggle.checked = settings.recordHistory;
 els.nativeHlsToggle.checked = settings.preferNativeHls;
 els.resumeToggle.checked = settings.resumePlayback;
 function tryNextImageSource(img) {
-  const proxy = img.dataset.proxySrc || '';
-  if (proxy && !img.dataset.proxyRetried) {
-    img.dataset.proxyRetried = '1';
-    img.src = `${proxy}${proxy.includes('?') ? '&' : '?'}retry=${Date.now()}`;
-    return true;
-  }
-
   const original = img.dataset.originalSrc || '';
   if (original && !img.dataset.originalTried) {
     img.dataset.originalTried = '1';
     img.src = original;
+    return true;
+  }
+
+  const proxy = img.dataset.proxySrc || '';
+  if (proxy && !img.dataset.proxyRetried) {
+    img.dataset.proxyRetried = '1';
+    img.src = `${proxy}${proxy.includes('?') ? '&' : '?'}retry=${Date.now()}`;
     return true;
   }
   return false;
@@ -97,7 +99,7 @@ function proxyImage(url, item = null) {
   try {
     const parsed = new URL(value);
     if (/(^|\.)doubanio\.com$/i.test(parsed.hostname)) {
-      const params = new URLSearchParams({ rev: '11', url: value });
+      const params = new URLSearchParams({ rev: '12', url: value });
       const doubanId = doubanIdOf(item);
       const kind = item?.mediaType === 'movie' ? 'movie' : item?.mediaType === 'tv' ? 'tv' : '';
       if (doubanId) params.set('id', doubanId);
@@ -163,6 +165,11 @@ function setActiveTab(view) {
 }
 function setCompactView(compact) {
   document.body.classList.toggle('compact-view', compact);
+}
+function cancelPendingSearch() {
+  searchSequence += 1;
+  activeSearchController?.abort();
+  activeSearchController = null;
 }
 
 function renderHero(item) {
@@ -243,6 +250,8 @@ function cardHtml(item, index, context = 'results') {
 }
 
 function bindCards(container, items, context) {
+  if (!container) return;
+
   const activateCard = async (card, event) => {
     const item = items[Number(card.dataset.index)];
     if (!item) return;
@@ -261,17 +270,17 @@ function bindCards(container, items, context) {
     }
   };
 
-  container.addEventListener('click', event => {
+  container.onclick = event => {
     const card = event.target.closest?.('.media-card');
     if (card && container.contains(card)) activateCard(card, event);
-  });
-  container.addEventListener('keydown', event => {
+  };
+  container.onkeydown = event => {
     if (event.key !== 'Enter' && event.key !== ' ') return;
     const card = event.target.closest?.('.media-card');
     if (!card || !container.contains(card)) return;
     event.preventDefault();
     activateCard(card, event);
-  });
+  };
 }
 function render(items, title, kicker) {
   const list = items || [];
@@ -324,6 +333,11 @@ function toggleFavorite(item, button) {
 }
 
 async function search(query) {
+  const sequence = ++searchSequence;
+  activeSearchController?.abort();
+  const controller = new AbortController();
+  activeSearchController = controller;
+
   currentView = 'search';
   setActiveTab('home');
   setCompactView(true);
@@ -333,14 +347,19 @@ async function search(query) {
   els.homeSections.classList.add('hidden');
   window.scrollTo({ top: 0, behavior: 'smooth' });
   try {
-    const payload = await api.search(query);
+    const payload = await api.search(query, controller.signal);
+    if (sequence !== searchSequence) return;
     render(payload.items || [], `“${query}”`, 'SEARCH RESULTS');
     if (payload.errors?.length) showNotice(`部分数据源不可用：${payload.errors.map(error => error.provider).join('、')}`, 'warning');
   } catch (error) {
+    if (sequence !== searchSequence || error?.name === 'AbortError') return;
     render([], '搜索失败', 'ERROR');
     showNotice(error.message, 'error');
   } finally {
-    setLoading(false);
+    if (sequence === searchSequence) {
+      setLoading(false);
+      if (activeSearchController === controller) activeSearchController = null;
+    }
   }
 }
 
@@ -456,6 +475,7 @@ function saveHistory(position = els.player.currentTime || 0, duration = els.play
 }
 
 function renderSavedView(view) {
+  cancelPendingSearch();
   currentView = view;
   setActiveTab(view);
   setCompactView(true);
@@ -498,9 +518,12 @@ els.heroInfoButton.addEventListener('click', () => els.homeSections.querySelecto
 document.querySelectorAll('.nav-tab').forEach(tab => tab.addEventListener('click', async () => {
   const view = tab.dataset.view;
   if (view === 'home') {
+    cancelPendingSearch();
+    currentView = 'home';
     setActiveTab('home');
     try {
       const home = await api.home();
+      if (currentView !== 'home') return;
       renderHome(home.sections);
       window.scrollTo({ top: 0, behavior: 'smooth' });
       if (home.notice) showNotice(home.notice, 'warning');
@@ -587,8 +610,10 @@ window.addEventListener('unhandledrejection', event => {
     els.sourcePills.innerHTML = (health.providers || []).map(provider => `<span class="source-pill ${provider.proxyEnabled ? 'proxied' : ''}">${escapeHtml(provider.name)}</span>`).join('');
     if (!health.providers?.length) showNotice('尚未配置数据源。请打开 /admin.html 添加兼容接口。', 'warning');
     const home = await api.home();
-    renderHome(home.sections);
-    if (home.notice) showNotice(home.notice, 'warning');
+    if (currentView === 'home') {
+      renderHome(home.sections);
+      if (home.notice) showNotice(home.notice, 'warning');
+    }
   } catch (error) {
     showNotice(error.message || '后端函数未连接', 'error');
   }
