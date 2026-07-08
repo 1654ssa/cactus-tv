@@ -1,6 +1,17 @@
 import type { AppData, Env } from '../_shared/types';
 
 const ALLOWED_HOSTS = /(^|\.)doubanio\.com$/i;
+const IMAGE_TYPE = /^image\//i;
+
+function noStore(message: string, status: number): Response {
+  return new Response(message, {
+    status,
+    headers: {
+      'cache-control': 'no-store',
+      'content-type': 'text/plain; charset=utf-8',
+    },
+  });
+}
 
 export const onRequestGet: PagesFunction<Env, any, AppData> = async ({ request }) => {
   const requestUrl = new URL(request.url);
@@ -10,33 +21,43 @@ export const onRequestGet: PagesFunction<Env, any, AppData> = async ({ request }
   try {
     imageUrl = new URL(source);
   } catch {
-    return new Response('Bad image URL', { status: 400 });
+    return noStore('Bad image URL', 400);
   }
 
   if (imageUrl.protocol !== 'https:' || !ALLOWED_HOSTS.test(imageUrl.hostname)) {
-    return new Response('Image host not allowed', { status: 403 });
+    return noStore('Image host not allowed', 403);
   }
 
   const cache = caches.default;
-  const cacheKey = new Request(requestUrl.toString(), request);
+  const cacheKey = new Request(requestUrl.toString(), { method: 'GET' });
   const cached = await cache.match(cacheKey);
-  if (cached) return cached;
+  if (cached) {
+    const cachedType = cached.headers.get('content-type') || '';
+    if (cached.ok && IMAGE_TYPE.test(cachedType)) return cached;
+    await cache.delete(cacheKey);
+  }
 
-  const response = await fetch(imageUrl.toString(), {
-    headers: {
-      Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-      Referer: 'https://movie.douban.com/',
-      'User-Agent': 'Mozilla/5.0',
-    },
-    redirect: 'follow',
-  });
+  let response: Response;
+  try {
+    response = await fetch(imageUrl.toString(), {
+      headers: {
+        Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+        Referer: 'https://movie.douban.com/',
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/121.0.0.0 Mobile Safari/537.36',
+      },
+      redirect: 'follow',
+    });
+  } catch {
+    return noStore('Image request failed', 502);
+  }
 
-  if (!response.ok || !response.body) {
-    return new Response('Image unavailable', { status: response.status || 502 });
+  const contentType = response.headers.get('content-type') || '';
+  if (!response.ok || !response.body || !IMAGE_TYPE.test(contentType)) {
+    return noStore('Image unavailable', response.ok ? 502 : response.status || 502);
   }
 
   const headers = new Headers();
-  headers.set('content-type', response.headers.get('content-type') || 'image/jpeg');
+  headers.set('content-type', contentType);
   headers.set('cache-control', 'public, max-age=86400, s-maxage=604800');
   headers.set('x-content-type-options', 'nosniff');
 
