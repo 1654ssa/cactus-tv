@@ -72,9 +72,16 @@
         <form id="settingsForm" class="admin-form">
           <label>站点名称<input id="siteName" /></label>
           <label>首页公告<textarea id="homeNotice" rows="4"></textarea></label>
+          <label>首页元数据
+            <select id="metadataSource">
+              <option value="auto">自动</option>
+              <option value="douban">豆瓣</option>
+              <option value="tmdb">TMDB</option>
+            </select>
+          </label>
           <button class="primary-button" type="submit">保存设置</button>
         </form>
-        <div class="code-note">ADMIN_TOKEN、TMDB_BEARER_TOKEN 等密钥只在 Cloudflare Variables and Secrets 中配置。</div>
+        <div class="code-note">豆瓣不需要密钥；选择 TMDB 时，需要在 Cloudflare 中配置 TMDB_BEARER_TOKEN。</div>
       </div>
     </section>
 
