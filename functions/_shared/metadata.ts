@@ -2,6 +2,12 @@ import { fetchWithTimeout } from './providers';
 import type { Env } from './types';
 
 const IMAGE_BASE = 'https://image.tmdb.org/t/p/w500';
+const DOUBAN_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36',
+  Referer: 'https://movie.douban.com/',
+  Origin: 'https://movie.douban.com',
+  Accept: 'application/json, text/plain, */*',
+};
 
 function normalized(value: string): string {
   return value.toLowerCase().normalize('NFKC').replace(/[\s\-_:：·•.，,()（）\[\]【】]/g, '').replace(/第?[一二三四五六七八九十0-9]+季$/u, '');
@@ -17,6 +23,13 @@ async function cachedJson(request: Request, ttl = 3600): Promise<any> {
   const cacheResponse = new Response(JSON.stringify(payload), { headers: { 'content-type': 'application/json', 'cache-control': `public, max-age=${ttl}` } });
   await cache.put(request, cacheResponse.clone());
   return payload;
+}
+
+export function resolveMetadataSource(value: string, env: Env): 'tmdb' | 'douban' {
+  const selected = String(value || 'auto').toLowerCase();
+  if (selected === 'tmdb') return 'tmdb';
+  if (selected === 'douban') return 'douban';
+  return env.TMDB_BEARER_TOKEN ? 'tmdb' : 'douban';
 }
 
 export async function tmdb(path: string, env: Env, params: Record<string, string> = {}, ttl = 3600): Promise<any | null> {
@@ -67,17 +80,89 @@ export async function tmdbDetail(id: number, mediaType: string, env: Env): Promi
   return payload ? mapTmdb(payload) : null;
 }
 
-export async function doubanSearch(query: string, env: Env): Promise<any | null> {
-  if (!env.DOUBAN_METADATA_URL) return null;
+export async function doubanList(type: 'movie' | 'tv', tag: string, ttl = 3600): Promise<any[]> {
+  const url = new URL('https://movie.douban.com/j/search_subjects');
+  url.searchParams.set('type', type);
+  url.searchParams.set('tag', tag);
+  url.searchParams.set('sort', 'recommend');
+  url.searchParams.set('page_limit', '20');
+  url.searchParams.set('page_start', '0');
+
   try {
-    const url = new URL(env.DOUBAN_METADATA_URL);
-    if (url.protocol !== 'https:') return null;
-    url.searchParams.set('q', query);
-    const response = await fetchWithTimeout(url.toString(), { headers: { Accept: 'application/json' } }, 6_000);
-    if (!response.ok) return null;
-    const payload: any = await response.json();
-    const item = (payload.items || payload.subjects || [])[0];
-    if (!item) return null;
-    return { id: String(item.id || ''), title: String(item.title || item.name || ''), rating: Number(item.rating?.average || item.rating || 0), url: String(item.url || item.alt || '') };
-  } catch { return null; }
+    const payload = await cachedJson(new Request(url.toString(), { headers: DOUBAN_HEADERS }), ttl);
+    return (payload?.subjects || []).filter((item: any) => item?.title && item?.cover).slice(0, 20).map((item: any) => ({
+      id: String(item.id || ''),
+      mediaType: type,
+      title: String(item.title || ''),
+      originalTitle: '',
+      year: String(item.card_subtitle || '').match(/(19|20)\d{2}/)?.[0] || '',
+      overview: '',
+      poster: String(item.cover || ''),
+      backdrop: '',
+      rating: Number(item.rate || 0),
+      votes: 0,
+      popularity: 0,
+      genres: [],
+      douban: {
+        id: String(item.id || ''),
+        title: String(item.title || ''),
+        rating: Number(item.rate || 0),
+        url: item.id ? `https://movie.douban.com/subject/${item.id}/` : '',
+      },
+    }));
+  } catch (error) {
+    console.warn('Douban list failed', error);
+    return [];
+  }
+}
+
+async function directDoubanSearch(query: string): Promise<any | null> {
+  const url = new URL('https://movie.douban.com/j/subject_suggest');
+  url.searchParams.set('q', query);
+  try {
+    const payload = await cachedJson(new Request(url.toString(), { headers: DOUBAN_HEADERS }), 21600);
+    const items = Array.isArray(payload) ? payload : [];
+    const target = normalized(query);
+    const item = items.find((candidate: any) => normalized(String(candidate.title || candidate.sub_title || '')) === target) || items[0];
+    if (!item?.id) return null;
+    return {
+      id: String(item.id),
+      title: String(item.title || item.sub_title || query),
+      rating: Number(item.rating?.value || item.rating || 0),
+      url: String(item.url || `https://movie.douban.com/subject/${item.id}/`).replace(/\\/g, ''),
+      poster: String(item.pic || item.img || item.cover_url || '').replace(/\\/g, '').replace(/^http:/, 'https:'),
+      year: String(item.year || ''),
+      mediaType: item.type === 'tv' ? 'tv' : 'movie',
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function doubanSearch(query: string, env: Env): Promise<any | null> {
+  if (env.DOUBAN_METADATA_URL) {
+    try {
+      const url = new URL(env.DOUBAN_METADATA_URL);
+      if (url.protocol === 'https:') {
+        url.searchParams.set('q', query);
+        const response = await fetchWithTimeout(url.toString(), { headers: { Accept: 'application/json' } }, 6_000);
+        if (response.ok) {
+          const payload: any = await response.json();
+          const item = (payload.items || payload.subjects || [])[0];
+          if (item) {
+            return {
+              id: String(item.id || ''),
+              title: String(item.title || item.name || ''),
+              rating: Number(item.rating?.average || item.rating?.value || item.rating || 0),
+              url: String(item.url || item.alt || ''),
+              poster: String(item.poster || item.cover || item.pic?.normal || item.pic || ''),
+              year: String(item.year || ''),
+              mediaType: item.type === 'tv' ? 'tv' : 'movie',
+            };
+          }
+        }
+      }
+    } catch { /* 使用豆瓣直连 */ }
+  }
+  return directDoubanSearch(query);
 }
