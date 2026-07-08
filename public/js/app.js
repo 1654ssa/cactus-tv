@@ -137,7 +137,7 @@ function cardHtml(item, index, context = 'results') {
   const fallback = name.trim().slice(0, 1).toUpperCase() || 'C';
 
   const image = visual
-    ? `<picture>${portraitVisual && portraitVisual !== landscapeVisual ? `<source media="(max-width: 1024px)" srcset="${escapeHtml(portraitVisual)}">` : ''}<img loading="lazy" decoding="async" fetchpriority="low" referrerpolicy="no-referrer" data-fallback="${escapeHtml(fallback)}" src="${escapeHtml(visual)}" alt="${escapeHtml(name)}"></picture>`
+    ? `<picture>${portraitVisual && portraitVisual !== explicitBackdrop ? `<source media="(max-width: 1024px)" srcset="${escapeHtml(portraitVisual)}">` : ''}<img loading="lazy" decoding="async" fetchpriority="low" referrerpolicy="no-referrer" data-fallback="${escapeHtml(fallback)}" src="${escapeHtml(visual)}" alt="${escapeHtml(name)}"></picture>`
     : `<div class="poster-fallback">${escapeHtml(fallback)}</div>`;
 
   const posterClass = portraitOnly ? 'poster poster-portrait-source' : 'poster';
