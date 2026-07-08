@@ -17,7 +17,7 @@ function suppliedToken(request: Request): string {
 export function requireAdmin(request: Request, env: Env): void {
   const configured = (env.ADMIN_TOKEN || '').trim();
   if (!configured) throw new HttpError(503, '尚未配置 ADMIN_TOKEN，管理后台已禁用', 'ADMIN_NOT_CONFIGURED');
-  if (configured.length < 16) throw new HttpError(503, 'ADMIN_TOKEN 至少需要 16 个字符', 'ADMIN_TOKEN_TOO_SHORT');
+  if (configured.length < 8) throw new HttpError(503, 'ADMIN_TOKEN 至少需要 8 个字符', 'ADMIN_TOKEN_TOO_SHORT');
   const provided = suppliedToken(request);
   if (!provided || !timingSafeEqual(provided, configured)) throw new HttpError(401, '管理密钥无效', 'ADMIN_TOKEN_INVALID');
 }
