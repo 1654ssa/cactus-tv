@@ -27,7 +27,21 @@ els.resumeToggle.checked = settings.resumePlayback;
 function escapeHtml(value = '') {
   return String(value).replace(/[&<>'"]/g, char => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', "'":'&#39;', '"':'&quot;' }[char]));
 }
-function safeImage(url) { return /^https?:\/\//i.test(url || '') ? url : ''; }
+function safeImage(url) {
+  const value = String(url || '').trim();
+  if (!/^https?:\/\//i.test(value)) return '';
+
+  try {
+    const parsed = new URL(value);
+    if (/(^|\.)doubanio\.com$/i.test(parsed.hostname)) {
+      return `/api/image?url=${encodeURIComponent(value)}`;
+    }
+  } catch {
+    return '';
+  }
+
+  return value;
+}
 function keyOf(item) { return item.key || `${item.provider}:${item.id}`; }
 function titleOf(item) { return item.name || item.title || '未命名'; }
 function savedItem(item) {
