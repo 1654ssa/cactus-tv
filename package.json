@@ -1,6 +1,6 @@
 {
   "name": "cactus-tv",
-  "version": "0.8.5",
+  "version": "0.8.6",
   "private": true,
   "description": "Cactus TV with Cloudflare Pages, D1 and CactusStreamflow Cache API edge caching.",
   "scripts": {
