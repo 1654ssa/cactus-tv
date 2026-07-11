@@ -1,73 +1,27 @@
 import { HttpError, ok } from '../_shared/http';
 import { getSetting } from '../_shared/db';
 import { bestTmdbMatch, doubanSearch, resolveMetadataSource, searchTmdb, tmdbDetail } from '../_shared/metadata';
-import { buildCmsUrl, fetchJson, findProvider, validateHttpsUrl } from '../_shared/providers';
+import { buildCmsUrl, fetchJson, findProvider } from '../_shared/providers';
 import type { AppData, Env, Provider } from '../_shared/types';
 
-type ProxyInfo = {
-  playbackUrl: string;
-  proxied: boolean;
-  proxyMode: 'direct' | 'allowlist';
-  proxyReason: string;
-  mediaHost: string;
-};
+function hostMatchesRule(hostname: string, rule: string): boolean {
+  const host = hostname.toLowerCase();
+  const normalized = rule.trim().toLowerCase();
+  if (!normalized) return false;
+  if (!normalized.startsWith('*.')) return host === normalized;
+  const base = normalized.slice(2);
+  if (base.split('.').length < 2) return false;
+  return host !== base && host.endsWith(`.${base}`);
+}
 
-/**
- * Only proxy explicitly allowlisted media hosts.
- *
- * v0.8.4 temporarily proxied every dynamic CDN through a signed ticket. Some
- * video CDNs bind their URLs to the viewer IP, browser headers or cookies, so
- * Cloudflare could not fetch those URLs even though the browser could. Falling
- * back to the original URL is therefore the safe default for unknown hosts.
- */
-function proxyInfo(provider: Provider, target: string): ProxyInfo {
-  let normalized = target;
-  let mediaHost = '';
+function proxyUrl(provider: Provider, target: string): string {
+  if (!provider.proxyEnabled) return target;
   try {
-    normalized = validateHttpsUrl(target);
-    mediaHost = new URL(normalized).hostname.toLowerCase();
-  } catch {
-    return {
-      playbackUrl: target,
-      proxied: false,
-      proxyMode: 'direct',
-      proxyReason: '片源不是可代理的 HTTPS 地址，已使用原始地址播放',
-      mediaHost,
-    };
-  }
-
-  if (!provider.proxyEnabled) {
-    return {
-      playbackUrl: normalized,
-      proxied: false,
-      proxyMode: 'direct',
-      proxyReason: '当前数据源未开启播放代理，已使用直连播放',
-      mediaHost,
-    };
-  }
-
-  const allowed = new Set([
-    new URL(provider.baseUrl).hostname.toLowerCase(),
-    ...provider.mediaHosts.map(host => host.toLowerCase()),
-  ]);
-  if (!allowed.has(mediaHost)) {
-    return {
-      playbackUrl: normalized,
-      proxied: false,
-      proxyMode: 'direct',
-      proxyReason: `媒体域名 ${mediaHost} 未加入代理白名单，已自动回退直连`,
-      mediaHost,
-    };
-  }
-
-  const params = new URLSearchParams({ provider: provider.id, url: normalized });
-  return {
-    playbackUrl: `/api/stream?${params.toString()}`,
-    proxied: true,
-    proxyMode: 'allowlist',
-    proxyReason: '',
-    mediaHost,
-  };
+    const host = new URL(target).hostname.toLowerCase();
+    const rules = [new URL(provider.baseUrl).hostname.toLowerCase(), ...provider.mediaHosts];
+    if (!rules.some(rule => hostMatchesRule(host, rule))) return target;
+    return `/api/stream?provider=${encodeURIComponent(provider.id)}&url=${encodeURIComponent(target)}`;
+  } catch { return target; }
 }
 
 function parseLines(fromRaw: string, urlRaw: string, provider: Provider) {
@@ -79,11 +33,7 @@ function parseLines(fromRaw: string, urlRaw: string, provider: Provider) {
       if (splitAt < 0) return null;
       const url = entry.slice(splitAt + 1).trim();
       if (!/^https?:\/\//i.test(url)) return null;
-      return {
-        name: entry.slice(0, splitAt).trim() || '播放',
-        url,
-        ...proxyInfo(provider, url),
-      };
+      return { name: entry.slice(0, splitAt).trim() || '播放', url, playbackUrl: proxyUrl(provider, url), proxied: proxyUrl(provider, url) !== url };
     }).filter(Boolean),
   })).filter(line => line.episodes.length > 0);
 }
@@ -107,17 +57,16 @@ export const onRequestGet: PagesFunction<Env, any, AppData> = async ({ request, 
   let douban: any = null;
   try {
     if (source === 'tmdb' && env.TMDB_BEARER_TOKEN) {
-      const candidates = await searchTmdb(name, env);
+      const candidates = await searchTmdb(name, env).catch(() => []);
       const matched = bestTmdbMatch(name, year, candidates);
-      tmdb = matched ? await tmdbDetail(matched.id, matched.mediaType, env) : null;
-      if (!tmdb && preference === 'auto') douban = await doubanSearch(name, env);
+      tmdb = matched ? await tmdbDetail(matched.id, matched.mediaType, env).catch(() => null) : null;
+      if (!tmdb && preference === 'auto') douban = await doubanSearch(name, env).catch(() => null);
     } else {
-      douban = await doubanSearch(name, env);
+      douban = await doubanSearch(name, env).catch(() => null);
     }
-  } catch (error) {
-    // Metadata is decorative. A temporary Douban/TMDB failure must never make
-    // the real video detail or playback URL unavailable.
-    console.warn('Detail metadata lookup failed; returning source detail', error);
+  } catch {
+    tmdb = null;
+    douban = null;
   }
 
   const itemKey = `${provider.id}:${String(item.vod_id ?? id)}`;
@@ -130,7 +79,6 @@ export const onRequestGet: PagesFunction<Env, any, AppData> = async ({ request, 
   }
   const rawSubtitle = String(item.vod_sub || '').trim();
   if (/^https:\/\//i.test(rawSubtitle)) subtitles.unshift({ id: 'source', name: '数据源字幕', lang: 'zh', url: rawSubtitle, format: rawSubtitle.split('.').pop() || 'vtt' });
-
   return ok({ item: {
     key: itemKey, id: String(item.vod_id ?? id), provider: provider.id, providerName: provider.name,
     name, pic: tmdb?.poster || douban?.poster || String(item.vod_pic ?? ''), backdrop: tmdb?.backdrop || '', remarks: String(item.vod_remarks ?? ''),
@@ -138,5 +86,5 @@ export const onRequestGet: PagesFunction<Env, any, AppData> = async ({ request, 
     lang: String(item.vod_lang ?? ''), content: tmdb?.overview || String(item.vod_content ?? item.vod_blurb ?? '').replace(/<[^>]+>/g, '').slice(0, 3000),
     director: String(item.vod_director ?? ''), actors: String(item.vod_actor ?? ''), lines: parseLines(String(item.vod_play_from ?? ''), String(item.vod_play_url ?? ''), provider),
     tmdb, douban, metadataSource: source, subtitles, proxyEnabled: provider.proxyEnabled,
-  }}, 200, { 'cache-control': 'no-store, private' });
+  }}, 200, { 'cache-control': 'private, no-store' });
 };

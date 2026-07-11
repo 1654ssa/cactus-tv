@@ -1,23 +1,27 @@
 import { HttpError, ok } from '../_shared/http';
 import { fetchWithTimeout, findProvider, validateHttpsUrl } from '../_shared/providers';
-import {
-  matchStreamflowObject,
-  normalizeStreamflowGeneration,
-  rememberStreamflowHint,
-  storeStreamflowObject,
-  validObjectId,
-  validStreamflowId,
-} from '../_shared/streamflow';
 import type { AppData, Env, Provider } from '../_shared/types';
 
 const PLAYLIST_LIMIT = 3_000_000;
 const SNIFF_LIMIT = 64 * 1024;
+const STRONG_AD_TOKEN = /(?:^|[\/_\-.?&=])(?:ads?|advert(?:isement)?s?|commercials?|promo(?:tion)?s?|pre-?roll|mid-?roll|post-?roll|casino|bet(?:ting)?|gambling|博彩|赌博)(?:[\/_\-.?&=]|$)/i;
+const AD_TEXT_TOKEN = /(?:广告|博彩|赌博|casino|gambling|advert(?:isement)?|commercial|pre-?roll|mid-?roll|post-?roll)/i;
+const AD_CUE_OUT = /^#EXT-X-(?:CUE-OUT(?:-CONT)?|SCTE35|OATCLS-SCTE35)\b/i;
+const AD_CUE_IN = /^#EXT-X-CUE-IN\b/i;
 
-type ByteRange = { start: number; length: number };
+function hostMatchesRule(hostname: string, rule: string): boolean {
+  const host = hostname.toLowerCase();
+  const normalized = rule.trim().toLowerCase();
+  if (!normalized) return false;
+  if (!normalized.startsWith('*.')) return host === normalized;
+  const base = normalized.slice(2);
+  if (base.split('.').length < 2) return false;
+  return host !== base && host.endsWith(`.${base}`);
+}
 
 function allowedHost(provider: Provider, hostname: string): boolean {
-  const allowed = new Set([new URL(provider.baseUrl).hostname.toLowerCase(), ...provider.mediaHosts.map(x => x.toLowerCase())]);
-  return allowed.has(hostname.toLowerCase());
+  const rules = [new URL(provider.baseUrl).hostname.toLowerCase(), ...provider.mediaHosts];
+  return rules.some(rule => hostMatchesRule(hostname, rule));
 }
 
 function assertMediaUrl(provider: Provider, raw: string): URL {
@@ -27,151 +31,154 @@ function assertMediaUrl(provider: Provider, raw: string): URL {
   return url;
 }
 
-function proxied(provider: Provider, absolute: string, streamflowId = '', generation = 1, trackId = '', objectId = ''): string {
+function proxied(provider: Provider, absolute: string, clean = false): string {
   const params = new URLSearchParams({ provider: provider.id, url: absolute });
-  if (validStreamflowId(streamflowId)) {
-    params.set('sf', streamflowId);
-    params.set('sfg', String(normalizeStreamflowGeneration(generation)));
-  }
-  if (trackId) params.set('sft', trackId);
-  if (objectId && validObjectId(objectId)) params.set('sfi', objectId);
+  if (clean) params.set('clean', '1');
   return `/api/stream?${params.toString()}`;
 }
 
-function parseAttributes(input: string): Record<string, string> {
-  const result: Record<string, string> = {};
-  const regex = /([A-Z0-9-]+)=("(?:[^"\\]|\\.)*"|[^,]*)/gi;
-  let match: RegExpExecArray | null;
-  while ((match = regex.exec(input))) {
-    let value = match[2].trim();
-    if (value.startsWith('"') && value.endsWith('"')) value = value.slice(1, -1).replace(/\\"/g, '"');
-    result[match[1].toUpperCase()] = value;
-  }
-  return result;
+function isAdDateRange(line: string): boolean {
+  if (!/^#EXT-X-DATERANGE:/i.test(line)) return false;
+  return /(?:CLASS|ID)="[^"]*(?:ad|advert|commercial|interstitial|scte)[^"]*"/i.test(line)
+    || /SCTE35-(?:OUT|CMD)=/i.test(line)
+    || /X-ASSET-URI=/i.test(line);
 }
 
-function parseByteRange(value: string): { length: number; offset?: number } | null {
-  const match = String(value || '').trim().match(/^(\d+)(?:@(\d+))?$/);
-  if (!match) return null;
-  const length = Number(match[1]);
-  const offset = match[2] == null ? undefined : Number(match[2]);
-  if (!(length > 0) || (offset != null && offset < 0)) return null;
-  return { length, offset };
+function hasImplicitAesIv(text: string): boolean {
+  return text.split(/\r?\n/).some(line => /^#EXT-X-KEY:/i.test(line)
+    && /METHOD=AES-128/i.test(line)
+    && !/\bIV=0x[0-9a-f]+/i.test(line));
 }
 
-function rangeSuffix(range?: ByteRange): string {
-  return range ? `-br-${range.start}-${range.length}` : '';
+function rewriteMediaSequence(lines: string[], leadingRemoved: number): string[] {
+  if (!leadingRemoved) return lines;
+  return lines.map(line => line.replace(/^#EXT-X-MEDIA-SEQUENCE:(\d+)\s*$/i, (_all, raw) => `#EXT-X-MEDIA-SEQUENCE:${Number(raw) + leadingRemoved}`));
 }
 
-function rewriteUriAttribute(line: string, rewrite: (uri: string) => string): string {
-  return line.replace(/URI="([^"]+)"/g, (_all, uri) => `URI="${rewrite(uri)}"`);
-}
+function cleanHlsPlaylist(text: string): { text: string; removed: number; applied: boolean; reason: string } {
+  if (!/#EXTINF:/i.test(text)) return { text, removed: 0, applied: false, reason: 'master-playlist' };
+  if (hasImplicitAesIv(text)) return { text, removed: 0, applied: false, reason: 'implicit-aes-iv' };
 
-function rewriteM3u8(text: string, base: URL, provider: Provider, streamflowId = '', generation = 1, inheritedTrack = 'main'): string {
   const lines = text.split(/\r?\n/);
-  const isMaster = lines.some(line => line.trim().startsWith('#EXT-X-STREAM-INF:'));
   const output: string[] = [];
-  const previousRangeEnd = new Map<string, number>();
-  let mediaSequence = 0;
-  let segmentIndex = 0;
-  let variantIndex = 0;
-  let audioIndex = 0;
-  let otherPlaylistIndex = 0;
-  let mapIndex = 0;
-  let keyIndex = 0;
-  let pendingVariant = false;
-  let pendingRange: { length: number; offset?: number } | null = null;
+  let pending: string[] = [];
+  let cueActive = false;
+  let cueWasExplicit = false;
+  let totalSegments = 0;
+  let removedSegments = 0;
+  let removedMarkers = 0;
+  let keptSegments = 0;
+  let leadingRemoved = 0;
+  let sawKeptSegment = false;
+  let insertDiscontinuity = false;
 
-  const materializeRange = (absolute: string, raw: { length: number; offset?: number } | null): ByteRange | undefined => {
-    if (!raw) return undefined;
-    const start = raw.offset == null ? (previousRangeEnd.get(absolute) || 0) : raw.offset;
-    previousRangeEnd.set(absolute, start + raw.length);
-    return { start, length: raw.length };
+  const flushNonSegmentPending = () => {
+    if (!pending.length) return;
+    output.push(...pending);
+    pending = [];
   };
 
   for (const rawLine of lines) {
-    const trimmed = rawLine.trim();
-    if (!trimmed) { output.push(rawLine); continue; }
+    const line = rawLine.trim();
 
-    if (trimmed.startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
-      mediaSequence = Math.max(0, Number(trimmed.slice(trimmed.indexOf(':') + 1)) || 0);
-      output.push(rawLine);
+    if (AD_CUE_OUT.test(line)) {
+      cueActive = true;
+      cueWasExplicit = true;
+      removedMarkers += 1;
+      insertDiscontinuity = sawKeptSegment;
       continue;
     }
-    if (trimmed.startsWith('#EXT-X-BYTERANGE:')) {
-      pendingRange = parseByteRange(trimmed.slice(trimmed.indexOf(':') + 1));
-      output.push(rawLine);
+    if (isAdDateRange(line)) {
+      // HLS interstitial signaling can be removed without deleting the main media timeline.
+      cueWasExplicit = true;
+      removedMarkers += 1;
       continue;
     }
-    if (trimmed.startsWith('#EXT-X-STREAM-INF:')) {
-      pendingVariant = true;
-      output.push(rawLine);
-      continue;
-    }
-
-    if (!trimmed.startsWith('#')) {
-      try {
-        const absolute = new URL(trimmed, base).toString();
-        if (isMaster) {
-          const track = pendingVariant ? `v${variantIndex++}` : `m${otherPlaylistIndex++}`;
-          output.push(proxied(provider, absolute, streamflowId, generation, track));
-          pendingVariant = false;
-        } else {
-          const range = materializeRange(absolute, pendingRange);
-          const objectId = `${inheritedTrack}--seg-${mediaSequence + segmentIndex}${rangeSuffix(range)}`;
-          output.push(proxied(provider, absolute, streamflowId, generation, inheritedTrack, objectId));
-          segmentIndex += 1;
-          pendingRange = null;
-        }
-      } catch { output.push(rawLine); }
+    if (AD_CUE_IN.test(line)) {
+      cueActive = false;
+      removedMarkers += 1;
+      insertDiscontinuity = sawKeptSegment;
       continue;
     }
 
-    if (trimmed.startsWith('#EXT-X-MEDIA:')) {
-      const attrs = parseAttributes(trimmed.slice(trimmed.indexOf(':') + 1));
-      const type = String(attrs.TYPE || '').toUpperCase();
-      if (!attrs.URI) { output.push(rawLine); continue; }
-      const track = type === 'AUDIO' ? `a${audioIndex++}` : `m${otherPlaylistIndex++}`;
-      output.push(rewriteUriAttribute(rawLine, uri => {
-        try { return proxied(provider, new URL(uri, base).toString(), streamflowId, generation, track); }
-        catch { return uri; }
-      }));
+    if (/^#EXTINF:/i.test(line)) {
+      flushNonSegmentPending();
+      pending = [rawLine];
       continue;
     }
 
-    if (!isMaster && trimmed.startsWith('#EXT-X-MAP:')) {
-      const attrs = parseAttributes(trimmed.slice(trimmed.indexOf(':') + 1));
-      output.push(rewriteUriAttribute(rawLine, uri => {
-        try {
-          const absolute = new URL(uri, base).toString();
-          const range = materializeRange(absolute, parseByteRange(attrs.BYTERANGE || ''));
-          const objectId = `${inheritedTrack}--map-${mapIndex++}${rangeSuffix(range)}`;
-          return proxied(provider, absolute, streamflowId, generation, inheritedTrack, objectId);
-        } catch { return uri; }
-      }));
-      continue;
-    }
-
-    if (!isMaster && trimmed.startsWith('#EXT-X-KEY:')) {
-      const attrs = parseAttributes(trimmed.slice(trimmed.indexOf(':') + 1));
-      if (String(attrs.METHOD || '').toUpperCase() === 'NONE' || !attrs.URI) {
-        output.push(rawLine);
-      } else {
-        const objectId = `${inheritedTrack}--key-${keyIndex++}`;
-        output.push(rewriteUriAttribute(rawLine, uri => {
-          try { return proxied(provider, new URL(uri, base).toString(), streamflowId, generation, inheritedTrack, objectId); }
-          catch { return uri; }
-        }));
+    if (pending.length) {
+      if (!line || line.startsWith('#')) {
+        pending.push(rawLine);
+        continue;
       }
+
+      totalSegments += 1;
+      const metadata = pending.join('\n');
+      const adByKeyword = STRONG_AD_TOKEN.test(line) || AD_TEXT_TOKEN.test(metadata);
+      const shouldRemove = cueActive || adByKeyword;
+
+      if (shouldRemove) {
+        removedSegments += 1;
+        if (!sawKeptSegment) leadingRemoved += 1;
+        else insertDiscontinuity = true;
+        pending = [];
+        continue;
+      }
+
+      if (insertDiscontinuity && sawKeptSegment && !pending.some(item => /^#EXT-X-DISCONTINUITY\b/i.test(item.trim()))) {
+        output.push('#EXT-X-DISCONTINUITY');
+      }
+      output.push(...pending, rawLine);
+      pending = [];
+      insertDiscontinuity = false;
+      keptSegments += 1;
+      sawKeptSegment = true;
       continue;
     }
 
-    output.push(rawLine.replace(/URI="([^"]+)"/g, (_all, uri) => {
-      try { return `URI="${proxied(provider, new URL(uri, base).toString(), streamflowId, generation, inheritedTrack)}"`; }
-      catch { return `URI="${uri}"`; }
-    }));
+    // Remove ad signaling tags, while keeping normal HLS metadata untouched.
+    if (AD_CUE_OUT.test(line) || AD_CUE_IN.test(line) || isAdDateRange(line)) continue;
+    output.push(rawLine);
   }
-  return output.join('\n');
+
+  flushNonSegmentPending();
+  if (!removedSegments && removedMarkers) {
+    return { text: output.join('\n'), removed: 0, applied: true, reason: 'interstitial-marker' };
+  }
+  if (!removedSegments || totalSegments < 3 || keptSegments < 2) {
+    return { text, removed: 0, applied: false, reason: removedSegments ? 'too-few-segments' : 'no-match' };
+  }
+
+  const ratio = removedSegments / Math.max(1, totalSegments);
+  // Keyword matching is intentionally conservative. Explicit SCTE/CUE markers are trusted more.
+  if ((!cueWasExplicit && ratio > 0.28) || ratio > 0.45) {
+    return { text, removed: 0, applied: false, reason: 'safety-rollback' };
+  }
+
+  return {
+    text: rewriteMediaSequence(output, leadingRemoved).join('\n'),
+    removed: removedSegments,
+    applied: true,
+    reason: cueWasExplicit ? 'cue-marker' : 'strong-keyword',
+  };
+}
+
+function rewriteM3u8(text: string, base: URL, provider: Provider, clean: boolean): { text: string; removed: number; cleanReason: string } {
+  const cleaned = clean ? cleanHlsPlaylist(text) : { text, removed: 0, applied: false, reason: 'disabled' };
+  const rewritten = cleaned.text.split(/\r?\n/).map(rawLine => {
+    const trimmed = rawLine.trim();
+    if (!trimmed) return rawLine;
+    if (!trimmed.startsWith('#')) {
+      try { return proxied(provider, new URL(trimmed, base).toString(), clean); }
+      catch { return rawLine; }
+    }
+    return rawLine.replace(/URI="([^"]+)"/g, (_all, uri) => {
+      try { return `URI="${proxied(provider, new URL(uri, base).toString(), clean)}"`; }
+      catch { return `URI="${uri}"`; }
+    });
+  }).join('\n');
+  return { text: rewritten, removed: cleaned.removed, cleanReason: cleaned.reason };
 }
 
 function escapeXml(value: string): string {
@@ -187,7 +194,7 @@ async function fetchRedirectSafe(provider: Provider, url: URL, request: Request)
   let current = url;
   for (let i = 0; i < 4; i += 1) {
     assertMediaUrl(provider, current.toString());
-    const headers = new Headers({ Accept: '*/*', 'User-Agent': 'CactusTV/0.8.6', ...provider.requestHeaders });
+    const headers = new Headers({ Accept: '*/*', 'User-Agent': 'CactusTV/1.1.0', ...provider.requestHeaders });
     const range = request.headers.get('range');
     if (range) headers.set('range', range);
     const response = await fetchWithTimeout(current.toString(), { headers, redirect: 'manual' }, 15_000);
@@ -280,26 +287,12 @@ function mediaHeaders(upstream: Response, contentType: string): Headers {
   return headers;
 }
 
-async function streamflowHit(request: Request, sessionId: string, objectId: string, generation: number): Promise<Response | null> {
-  if (!validStreamflowId(sessionId) || !validObjectId(objectId)) return null;
-  const origin = new URL(request.url).origin;
-  return matchStreamflowObject(origin, sessionId, objectId, generation, request.headers.get('range') || '');
-}
-
-export const onRequestGet: PagesFunction<Env, any, AppData> = async ({ request, env, waitUntil }) => {
-  const requestUrl = new URL(request.url);
-  const params = requestUrl.searchParams;
+export const onRequestGet: PagesFunction<Env, any, AppData> = async ({ request, env }) => {
+  const params = new URL(request.url).searchParams;
   const provider = await findProvider(env, params.get('provider') || '');
   if (!provider || !provider.enabled || !provider.proxyEnabled) throw new HttpError(404, '该数据源未启用受控代理', 'PROXY_DISABLED');
 
-  const streamflowId = params.get('sf') || '';
-  const generation = normalizeStreamflowGeneration(params.get('sfg'));
-  const objectId = params.get('sfi') || '';
-  if (streamflowId && objectId) {
-    const hit = await streamflowHit(request, streamflowId, objectId, generation);
-    if (hit) return hit;
-  }
-
+  const clean = params.get('clean') === '1';
   const target = assertMediaUrl(provider, params.get('url') || '');
   const upstream = await fetchRedirectSafe(provider, target, request);
   if (!upstream.ok && upstream.status !== 206) throw new HttpError(502, `媒体上游返回 HTTP ${upstream.status}`, 'MEDIA_UPSTREAM_ERROR');
@@ -319,7 +312,7 @@ export const onRequestGet: PagesFunction<Env, any, AppData> = async ({ request, 
 
   if (params.get('probe') === '1') {
     try { await rest?.cancel(); } catch {}
-    return ok({ kind, contentType, finalUrl: finalUrl.toString() }, 200, { 'cache-control': 'no-store, private' });
+    return ok({ kind, contentType, finalUrl: finalUrl.toString(), clean }, 200, { 'cache-control': 'no-store, private' });
   }
 
   if (kind === 'hls') {
@@ -334,22 +327,16 @@ export const onRequestGet: PagesFunction<Env, any, AppData> = async ({ request, 
     }
     if (bytes.byteLength > PLAYLIST_LIMIT) throw new HttpError(502, '播放列表过大', 'PLAYLIST_TOO_LARGE');
     const text = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
-    const trackId = (params.get('sft') || 'main').replace(/[^a-zA-Z0-9._-]/g, '').slice(0, 40) || 'main';
-    const isMaster = text.split(/\r?\n/).some(line => line.trim().startsWith('#EXT-X-STREAM-INF:'));
-    if (!isMaster && validStreamflowId(streamflowId) && /^(?:main|v\d+)$/.test(trackId)) {
-      waitUntil(rememberStreamflowHint(requestUrl.origin, streamflowId, generation, {
-        provider: provider.id,
-        playlistUrl: finalUrl.toString(),
-        trackId,
-      }).catch(() => {}));
-    }
-    return new Response(rewriteM3u8(text, finalUrl, provider, streamflowId, generation, trackId), {
+    const rewritten = rewriteM3u8(text, finalUrl, provider, clean);
+    return new Response(rewritten.text, {
       headers: {
         'content-type': 'application/vnd.apple.mpegurl; charset=utf-8',
         'cache-control': 'private, max-age=10, stale-while-revalidate=20',
         'access-control-allow-origin': '*',
         'x-cactus-media-kind': 'hls',
-        ...(streamflowId ? { 'x-cactus-streamflow': 'MANIFEST' } : {}),
+        'x-cactus-cleanstream': clean ? (rewritten.removed ? 'FILTERED' : 'PASS') : 'OFF',
+        'x-cactus-cleanstream-removed': String(rewritten.removed),
+        'x-cactus-cleanstream-reason': rewritten.cleanReason,
       },
     });
   }
@@ -384,19 +371,7 @@ export const onRequestGet: PagesFunction<Env, any, AppData> = async ({ request, 
 
   const headers = mediaHeaders(upstream, contentType);
   headers.set('x-cactus-media-kind', kind || 'media');
-  if (streamflowId && objectId) headers.set('x-cactus-streamflow', 'MISS');
   if (!headers.get('content-type') || contentType.includes('text/plain')) headers.set('content-type', 'application/octet-stream');
   const body = prefix.byteLength ? combinedBody(prefix, rest) : rest;
-  const response = new Response(body, { status: upstream.status, headers });
-  if (validStreamflowId(streamflowId) && validObjectId(objectId)) {
-    waitUntil(storeStreamflowObject(
-      requestUrl.origin,
-      streamflowId,
-      objectId,
-      generation,
-      request.headers.get('range') || '',
-      response.clone(),
-    ).catch(error => console.warn('CactusStreamflow cache write failed', error)));
-  }
-  return response;
+  return new Response(body, { status: upstream.status, headers });
 };

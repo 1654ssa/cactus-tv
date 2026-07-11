@@ -36,7 +36,7 @@ export const onRequestGet: PagesFunction<Env, any, AppData> = async context => {
 
   const cacheUrl = new URL(request.url);
   cacheUrl.searchParams.set('q', query.normalize('NFKC'));
-  cacheUrl.searchParams.set('v', '5');
+  cacheUrl.searchParams.set('v', '4');
   const cacheKey = new Request(cacheUrl.toString(), { method: 'GET' });
   const cached = await caches.default.match(cacheKey);
   if (cached) return cached;
@@ -48,13 +48,11 @@ export const onRequestGet: PagesFunction<Env, any, AppData> = async context => {
     });
   }
 
-  const metadataResultsPromise = Promise.allSettled([
-    searchTmdb(query, env),
-    doubanSearch(query, env),
-  ]);
+  const metadataPromise = searchTmdb(query, env).catch(() => []);
+  const doubanPromise = doubanSearch(query, env).catch(() => null);
   const settled = await mapLimit(providers, 3, async provider => {
     const started = Date.now();
-    const payload = await fetchJson(buildCmsUrl(provider, { ac: 'detail', wd: query }), provider, 8_000);
+    const payload = await fetchJson(buildCmsUrl(provider, { ac: 'detail', wd: query }), provider, 7_000);
     const list = Array.isArray(payload?.list) ? payload.list : [];
     return {
       latency: Date.now() - started,
@@ -104,11 +102,7 @@ export const onRequestGet: PagesFunction<Env, any, AppData> = async context => {
     }
   });
 
-  const [tmdbResult, doubanResult] = await metadataResultsPromise;
-  const tmdbCandidates = tmdbResult.status === 'fulfilled' ? tmdbResult.value : [];
-  const douban = doubanResult.status === 'fulfilled' ? doubanResult.value : null;
-  if (tmdbResult.status === 'rejected') errors.push({ provider: 'TMDB 元数据', error: '元数据暂时不可用' });
-  if (doubanResult.status === 'rejected') errors.push({ provider: '豆瓣元数据', error: '元数据暂时不可用' });
+  const [tmdbCandidates, douban] = await Promise.all([metadataPromise, doubanPromise]);
   const items = [...grouped.values()].map(item => {
     const tmdb = bestTmdbMatch(item.name, item.year, tmdbCandidates);
     const preferred = [...item.sources].sort((a, b) => a.latency - b.latency)[0];
@@ -126,10 +120,8 @@ export const onRequestGet: PagesFunction<Env, any, AppData> = async context => {
   }).sort((a, b) => (b.sourceCount - a.sourceCount) || ((b.tmdb?.popularity || 0) - (a.tmdb?.popularity || 0)));
 
   const response = ok({ items: items.slice(0, 80), errors, query }, 200, {
-    'cache-control': errors.length
-      ? 'private, no-store'
-      : 'public, max-age=30, s-maxage=120, stale-while-revalidate=300',
+    'cache-control': 'public, max-age=60, s-maxage=120, stale-while-revalidate=600',
   });
-  if (!errors.length) context.waitUntil(caches.default.put(cacheKey, response.clone()));
+  if (items.length && errors.length < providers.length) context.waitUntil(caches.default.put(cacheKey, response.clone()));
   return response;
 };
