@@ -70,7 +70,6 @@ export type StreamflowPrefetchInput = {
   position: number;
   duration: number;
   phase: string;
-  allowUnlisted: boolean;
 };
 
 function allowedHosts(provider: Provider): Set<string> {
@@ -80,11 +79,11 @@ function allowedHosts(provider: Provider): Set<string> {
   ]);
 }
 
-export function providerAllowsUrl(provider: Provider, raw: string, allowUnlisted = false): URL {
+export function providerAllowsUrl(provider: Provider, raw: string): URL {
   let url: URL;
   try { url = new URL(raw); } catch { throw new HttpError(400, '缓存源地址无效', 'STREAMFLOW_INVALID_SOURCE'); }
   if (url.protocol !== 'https:') throw new HttpError(400, '缓存仅支持 HTTPS 片源', 'STREAMFLOW_HTTPS_REQUIRED');
-  if (!allowUnlisted && !allowedHosts(provider).has(url.hostname.toLowerCase())) {
+  if (!allowedHosts(provider).has(url.hostname.toLowerCase())) {
     throw new HttpError(403, `媒体主机 ${url.hostname} 不在数据源白名单中`, 'STREAMFLOW_HOST_BLOCKED');
   }
   url.hash = '';
@@ -322,22 +321,22 @@ async function readStreamflowHint(origin: string, sessionId: string, generation:
   } catch { return null; }
 }
 
-async function fetchAllowed(provider: Provider, rawUrl: string, range = '', maxAttempts = 4, allowUnlisted = false): Promise<Response> {
-  let current = providerAllowsUrl(provider, rawUrl, allowUnlisted);
+async function fetchAllowed(provider: Provider, rawUrl: string, range = '', maxAttempts = 4): Promise<Response> {
+  let current = providerAllowsUrl(provider, rawUrl);
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    const headers = new Headers({ Accept: '*/*', 'User-Agent': 'CactusTV/0.8.4', ...provider.requestHeaders });
+    const headers = new Headers({ Accept: '*/*', 'User-Agent': 'CactusTV/0.8.6', ...provider.requestHeaders });
     if (range) headers.set('range', range);
     const response = await fetchWithTimeout(current.toString(), { headers, redirect: 'manual' }, 14_000);
     if (![301, 302, 303, 307, 308].includes(response.status)) return response;
     const location = response.headers.get('location');
     if (!location) return response;
-    current = providerAllowsUrl(provider, new URL(location, current).toString(), allowUnlisted);
+    current = providerAllowsUrl(provider, new URL(location, current).toString());
   }
   throw new HttpError(502, '媒体地址重定向次数过多', 'TOO_MANY_REDIRECTS');
 }
 
-async function fetchPlaylist(provider: Provider, rawUrl: string, allowUnlisted = false): Promise<{ text: string; url: URL }> {
-  const response = await fetchAllowed(provider, rawUrl, '', 2, allowUnlisted);
+async function fetchPlaylist(provider: Provider, rawUrl: string): Promise<{ text: string; url: URL }> {
+  const response = await fetchAllowed(provider, rawUrl, '', 2);
   if (!response.ok) throw new HttpError(502, `播放列表上游返回 HTTP ${response.status}`, 'STREAMFLOW_PLAYLIST_ERROR');
   const length = Number(response.headers.get('content-length') || 0);
   if (length > MAX_PLAYLIST_BYTES) throw new HttpError(502, '播放列表过大', 'PLAYLIST_TOO_LARGE');
@@ -346,8 +345,8 @@ async function fetchPlaylist(provider: Provider, rawUrl: string, allowUnlisted =
     throw new HttpError(415, 'CactusStreamflow 目前只预取 HLS 点播', 'STREAMFLOW_HLS_REQUIRED');
   }
   const finalUrl = response.url
-    ? providerAllowsUrl(provider, response.url, allowUnlisted)
-    : providerAllowsUrl(provider, rawUrl, allowUnlisted);
+    ? providerAllowsUrl(provider, response.url)
+    : providerAllowsUrl(provider, rawUrl);
   return { text, url: finalUrl };
 }
 
@@ -505,7 +504,7 @@ async function cachePlannedObject(input: StreamflowPrefetchInput, object: Planne
   const range = rangeHeader(object.range);
   const key = streamflowObjectCacheRequest(input.origin, input.sessionId, object.objectId, input.generation, range);
   if (await caches.default.match(key)) return 'hit';
-  const response = await fetchAllowed(input.provider, object.url, range, 2, input.allowUnlisted);
+  const response = await fetchAllowed(input.provider, object.url, range, 2);
   if (!response.ok && response.status !== 206) return 'skipped';
   const length = Number(response.headers.get('content-length') || 0);
   if (length > MAX_PREFETCH_OBJECT_BYTES) {
@@ -556,13 +555,13 @@ export async function prefetchStreamflow(input: StreamflowPrefetchInput): Promis
   const hint = await readStreamflowHint(input.origin, input.sessionId, input.generation);
   let playlistUrl = hint?.provider === input.provider.id ? hint.playlistUrl : input.sourceUrl;
   let trackId = hint?.provider === input.provider.id ? hint.trackId : 'main';
-  let playlist = await fetchPlaylist(input.provider, playlistUrl, input.allowUnlisted);
+  let playlist = await fetchPlaylist(input.provider, playlistUrl);
 
   const variant = chooseVariant(playlist.text, playlist.url);
   if (variant) {
     playlistUrl = variant.url;
     trackId = variant.trackId;
-    playlist = await fetchPlaylist(input.provider, playlistUrl, input.allowUnlisted);
+    playlist = await fetchPlaylist(input.provider, playlistUrl);
   }
 
   const allSegments = parseMediaPlaylist(playlist.text, playlist.url, trackId)
