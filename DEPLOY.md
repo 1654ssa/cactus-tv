@@ -683,3 +683,25 @@ package.json
 ## D1 片单同步（0.6.3+）
 
 收藏和继续观看记录会自动写入现有的 `DB` 绑定。接口首次运行时会自动创建 `favorites` 和 `watch_history` 表，因此从旧版本升级后只需正常推送代码并等待 Cloudflare Pages 部署完成，不需要重新创建 D1，也不需要添加用户表或用户 ID。
+
+---
+
+# v0.7.0 CactusStreamflow 升级
+
+从旧版升级到 v0.7.0 后，原来的 Pages + D1 仍然保留，但必须额外添加 R2、Queue 和独立 Worker。只覆盖 GitHub 文件不会启用云端缓存。
+
+完整步骤请直接打开：
+
+```text
+CACTUS_STREAMFLOW.md
+```
+
+最少需要完成：
+
+1. 在原 D1 中执行 `migrations/0003_streamflow.sql`。
+2. 创建 R2 Bucket：`cactus-streamflow-cache`。
+3. 创建 Queue：`cactus-streamflow-jobs`。
+4. 给 Pages 添加 `STREAMFLOW_R2` 和 `STREAMFLOW_QUEUE`，保留 `DB`。
+5. 修改 `streamflow-worker/wrangler.toml` 中的 D1 `database_id`。
+6. 执行 `npm install` 和 `npm run streamflow:deploy`。
+7. 重新部署 Pages，确认 `/api/health` 中 `streamflowReady` 为 `true`。

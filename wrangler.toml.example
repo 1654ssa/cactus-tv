@@ -2,9 +2,18 @@ name = "cactus-tv"
 compatibility_date = "2026-07-01"
 pages_build_output_dir = "./public"
 
-# 本地开发可以保留下面的 ID。
-# 线上部署按 DEPLOY.md 在 Cloudflare Pages 中绑定 D1。
+# Cactus TV 主站 Pages Functions 使用同一个 D1。
 [[d1_databases]]
 binding = "DB"
 database_name = "cactus-tv-db"
-database_id = "local-cactus-tv-db"
+database_id = "替换为你的 D1 database_id"
+
+# CactusStreamflow：Pages 读取缓存分片，后台 Worker 写入同一个 Bucket。
+[[r2_buckets]]
+binding = "STREAMFLOW_R2"
+bucket_name = "cactus-streamflow-cache"
+
+# Pages 只作为 Queue producer；consumer 位于 streamflow-worker/。
+[[queues.producers]]
+binding = "STREAMFLOW_QUEUE"
+queue = "cactus-streamflow-jobs"
