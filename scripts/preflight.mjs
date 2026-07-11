@@ -7,7 +7,7 @@ const required = [
   'public/vendor/hls.min.js', 'public/vendor/dash.all.min.js', 'functions/_middleware.ts', 'functions/_shared/auth.ts',
   'functions/api/health.ts', 'functions/api/stream.ts', 'functions/api/subtitle.ts', 'functions/api/library.ts',
   'functions/api/admin/providers.ts', 'migrations/0001_init.sql', 'migrations/0002_library.sql',
-  'CACTUS_PLAYER_2.md', 'DEPLOY.md', 'PATCH_INSTALL.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md',
+  'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md',
 ];
 
 const failures = [];
@@ -34,7 +34,7 @@ try {
 
 try {
   const html = await readFile('public/index.html', 'utf8');
-  for (const ref of ['/styles.css?v=1.1.0', '/js/app.js?v=1.1.0']) {
+  for (const ref of ['/styles.css?v=1.1.1', '/js/app.js?v=1.1.1']) {
     if (!html.includes(ref)) failures.push(`首页缺少或未升级资源引用：${ref}`);
   }
   if (/登录 Cactus TV|loginForm|authDialog/.test(html)) failures.push('首页仍包含登录界面');
@@ -45,7 +45,7 @@ try {
 
 try {
   const app = await readFile('public/js/app.js', 'utf8');
-  for (const token of ['applyCleanStream', "import('./player.js?v=1.1.0')", "import('./player-ui.js?v=1.1.0')", 'buildPersonalizedHome']) {
+  for (const token of ['applyCleanStream', "import('./player.js?v=1.1.1')", "import('./player-ui.js?v=1.1.1')", 'buildPersonalizedHome']) {
     if (!app.includes(token)) failures.push(`前端主程序缺少：${token}`);
   }
   if (/sendStreamflowHeartbeat|prepareStreamflow|streamflowEnabled/.test(app)) failures.push('前端仍包含主动 Streamflow 逻辑');
