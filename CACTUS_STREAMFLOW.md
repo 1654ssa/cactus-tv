@@ -1,6 +1,20 @@
 # CactusStreamflow 仙人掌流式缓存
 
-CactusStreamflow v0.8.3 使用 **Cloudflare Cache API**。它不需要 R2、Queue、信用卡或额外 Worker，只依赖原来的 Cloudflare Pages、Pages Functions 和 D1。
+CactusStreamflow v0.8.4 使用 **Cloudflare Cache API**。它不需要 R2、Queue、信用卡或额外 Worker，只依赖原来的 Cloudflare Pages、Pages Functions 和 D1。
+
+
+## 动态 CDN 与短期媒体凭证
+
+Apple CMS 返回的播放地址经常使用与接口域名不同、并且会变化的 CDN 域名。v0.8.4 在数据源开启播放代理且站点已配置 `ADMIN_TOKEN` 时，为该数据源签发 24 小时短期媒体凭证：
+
+- 只在当前私人站点内生成和验证；
+- 只授权指定数据源；
+- HLS 清单重写后的所有子资源继承同一凭证；
+- 不需要管理员追着把每个临时 CDN 域名加入白名单；
+- 凭证过期后自动失效；
+- 没有有效凭证时，仍严格使用原媒体域名白名单。
+
+播放器右上角的 Streamflow 面板现在不会因为未满足条件而消失。它会直接显示“未启动”以及原因，例如代理关闭、Cache API 未就绪、地址不是 HTTPS 或片源不是 HLS。
 
 ## 工作原理
 
@@ -106,7 +120,7 @@ Cache API 不是 R2：
 
 ## 部署
 
-v0.8.3 不新增 Cloudflare 资源。新用户按以下方式部署：
+v0.8.4 不新增 Cloudflare 资源。新用户按以下方式部署：
 
 ```text
 Fork GitHub 项目
@@ -129,7 +143,7 @@ STREAMFLOW_QUEUE
 0003_streamflow.sql
 ```
 
-已有 Cactus TV 用户只需要同步 v0.8.3 代码，Cloudflare 端无需新增配置。
+已有 Cactus TV 用户只需要同步 v0.8.4 代码，Cloudflare 端无需新增配置。
 
 ## 检查
 

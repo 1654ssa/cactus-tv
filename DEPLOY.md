@@ -1,4 +1,4 @@
-# Cactus TV v0.8.3 部署教程（Fork + Cloudflare Pages）
+# Cactus TV v0.8.4 部署教程（Fork + Cloudflare Pages）
 
 这份教程使用推荐部署方式：
 
@@ -620,9 +620,9 @@ package.json
 
 ---
 
-# v0.8.3 CactusStreamflow 全程 600 秒滚动缓存升级
+# v0.8.4 CactusStreamflow 代理授权与状态面板升级
 
-从旧版升级到 v0.8.3 后，仍然只需要原来的 Pages + D1。CactusStreamflow 使用 Cache API，从开始播放就维持前方至少 600 秒的滚动预取，并保留暂停续批和播放器性能面板；仍不需要 R2、Queue 或独立 Worker。
+从旧版升级到 v0.8.4 后，仍然只需要原来的 Pages + D1。CactusStreamflow 使用 Cache API，从开始播放就维持前方至少 600 秒的滚动预取，并保留暂停续批和播放器性能面板；仍不需要 R2、Queue 或独立 Worker。
 
 完整说明：
 
@@ -632,7 +632,7 @@ CACTUS_STREAMFLOW.md
 
 升级步骤：
 
-1. 在自己的 Fork 中同步或提交 v0.8.3 代码。
+1. 在自己的 Fork 中同步或提交 v0.8.4 代码。
 2. 删除仓库里的 `streamflow-worker/`。
 3. 删除 `migrations/0003_streamflow.sql`。
 4. 在 Pages Settings → Bindings 中删除 `STREAMFLOW_R2` 和 `STREAMFLOW_QUEUE`（如果以前添加过）。
@@ -641,3 +641,12 @@ CACTUS_STREAMFLOW.md
 7. 重新部署 Pages，打开 `/api/health`，确认 `streamflowReady` 为 `true`、`streamflowEngine` 为 `cache-api`。
 
 旧 R2 版留下的三张 D1 表不会影响运行，是否删除均可。
+
+
+## v0.8.4 额外说明
+
+不需要修改 Cloudflare 绑定。只要原站点已有有效的 `ADMIN_TOKEN`、D1 绑定 `DB` 和 Pages Functions，更新代码并等待 Pages 自动部署即可。
+
+新版会利用 `ADMIN_TOKEN` 生成短期媒体凭证，使数据源返回的动态 CDN 域名也能安全进入受控代理。媒体域名白名单仍保留，作为没有凭证时的严格回退规则。
+
+部署后打开影片，播放器右上角必须能看到 CactusStreamflow 面板。即使未启动，面板也会显示具体原因，不再完全隐藏。
