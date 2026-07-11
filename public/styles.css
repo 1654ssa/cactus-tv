@@ -1862,7 +1862,7 @@ footer { display: flex; justify-content: space-between; gap: 30px; width: calc(1
   box-shadow: 0 10px 28px rgba(0,0,0,.28);
   backdrop-filter: blur(14px);
   -webkit-backdrop-filter: blur(14px);
-  pointer-events: none;
+  pointer-events: auto;
   transition: opacity .2s ease, transform .2s ease;
 }
 .player-streamflow.hidden { display: none; }
@@ -1881,6 +1881,48 @@ footer { display: flex; justify-content: space-between; gap: 30px; width: calc(1
   color: #8df3ad;
   white-space: nowrap;
 }
+.player-streamflow-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.player-streamflow-head-actions button {
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: rgba(255,255,255,.10);
+  color: rgba(255,255,255,.78);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+.player-streamflow-head-actions button:hover { background: rgba(255,255,255,.18); color: #fff; }
+.player-streamflow-chip {
+  position: absolute;
+  z-index: 10;
+  top: max(14px, env(safe-area-inset-top));
+  right: max(14px, env(safe-area-inset-right));
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 30px;
+  padding: 6px 10px;
+  border: 1px solid rgba(255,255,255,.13);
+  border-radius: 999px;
+  background: rgba(8,8,10,.72);
+  color: rgba(255,255,255,.76);
+  box-shadow: 0 6px 18px rgba(0,0,0,.24);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  cursor: pointer;
+}
+.player-streamflow-chip.hidden { display: none; }
+.player-streamflow-chip span { font-size: 10px; }
+.player-streamflow-chip strong { color: #8df3ad; font-size: 10px; font-weight: 750; }
 .player-streamflow > small {
   display: block;
   margin-top: 5px;
@@ -1919,6 +1961,10 @@ footer { display: flex; justify-content: space-between; gap: 30px; width: calc(1
     padding: 8px 10px;
   }
   .player-streamflow > small { font-size: 10px; }
+  .player-streamflow-chip {
+    top: max(10px, env(safe-area-inset-top));
+    right: max(10px, env(safe-area-inset-right));
+  }
 }
 .player-streamflow.streamflow-error .player-streamflow-head span { color: #ffbd70; }
 .player-streamflow.streamflow-error .player-streamflow-progress span { color: #ff9b55; }
