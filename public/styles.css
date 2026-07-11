@@ -1789,3 +1789,60 @@ footer { display: flex; justify-content: space-between; gap: 30px; width: calc(1
   .player-dialog .player-tools select,
   .player-dialog .player-source-switch { width: 100%; }
 }
+
+/* CactusStreamflow */
+.streamflow-panel {
+  margin-top: 16px;
+  padding: 15px;
+  border: 1px solid rgba(255,255,255,.1);
+  border-radius: 16px;
+  background: rgba(255,255,255,.035);
+}
+.streamflow-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+.streamflow-panel-head > div { display: grid; gap: 4px; }
+.streamflow-panel-head strong { font-size: 14px; }
+.streamflow-panel-head small,
+.streamflow-session small { color: rgba(255,255,255,.52); line-height: 1.45; }
+.streamflow-panel-head button {
+  min-width: 58px;
+  min-height: 34px;
+  padding: 0 12px;
+  border: 1px solid rgba(255,255,255,.12);
+  border-radius: 10px;
+  background: rgba(255,255,255,.06);
+  color: #fff;
+}
+.streamflow-sessions { display: grid; gap: 8px; margin-top: 12px; }
+.streamflow-session {
+  display: grid;
+  gap: 3px;
+  padding: 10px 11px;
+  border-radius: 11px;
+  background: rgba(0,0,0,.22);
+}
+.streamflow-session strong {
+  overflow: hidden;
+  color: rgba(255,255,255,.9);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.streamflow-clear {
+  width: 100%;
+  min-height: 42px;
+  margin-top: 12px;
+  border: 1px solid rgba(255,112,112,.22);
+  border-radius: 12px;
+  background: rgba(255,72,72,.08);
+  color: #ffb0b0;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 750;
+}
+.streamflow-clear:disabled,
+.streamflow-panel-head button:disabled { opacity: .45; cursor: wait; }
