@@ -26,6 +26,7 @@ const state = {
     resumePlayback: true,
     autoFailover: true,
     autoNext: true,
+    streamflowEnabled: true,
     ...read('cactus:settings:v2', {}),
     ...read(KEYS.settings, {}),
   },
