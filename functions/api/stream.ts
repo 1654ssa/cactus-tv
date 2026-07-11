@@ -1,6 +1,13 @@
 import { HttpError, ok } from '../_shared/http';
 import { fetchWithTimeout, findProvider, validateHttpsUrl } from '../_shared/providers';
-import { ensureStreamflowSchema, streamflowObjectKey, validObjectId, validStreamflowId } from '../_shared/streamflow';
+import {
+  matchStreamflowObject,
+  normalizeStreamflowGeneration,
+  rememberStreamflowHint,
+  storeStreamflowObject,
+  validObjectId,
+  validStreamflowId,
+} from '../_shared/streamflow';
 import type { AppData, Env, Provider } from '../_shared/types';
 
 const PLAYLIST_LIMIT = 3_000_000;
@@ -20,9 +27,12 @@ function assertMediaUrl(provider: Provider, raw: string): URL {
   return url;
 }
 
-function proxied(provider: Provider, absolute: string, streamflowId = '', trackId = '', objectId = ''): string {
+function proxied(provider: Provider, absolute: string, streamflowId = '', generation = 1, trackId = '', objectId = ''): string {
   const params = new URLSearchParams({ provider: provider.id, url: absolute });
-  if (validStreamflowId(streamflowId)) params.set('sf', streamflowId);
+  if (validStreamflowId(streamflowId)) {
+    params.set('sf', streamflowId);
+    params.set('sfg', String(normalizeStreamflowGeneration(generation)));
+  }
   if (trackId) params.set('sft', trackId);
   if (objectId && validObjectId(objectId)) params.set('sfi', objectId);
   return `/api/stream?${params.toString()}`;
@@ -57,7 +67,7 @@ function rewriteUriAttribute(line: string, rewrite: (uri: string) => string): st
   return line.replace(/URI="([^"]+)"/g, (_all, uri) => `URI="${rewrite(uri)}"`);
 }
 
-function rewriteM3u8(text: string, base: URL, provider: Provider, streamflowId = '', inheritedTrack = 'main'): string {
+function rewriteM3u8(text: string, base: URL, provider: Provider, streamflowId = '', generation = 1, inheritedTrack = 'main'): string {
   const lines = text.split(/\r?\n/);
   const isMaster = lines.some(line => line.trim().startsWith('#EXT-X-STREAM-INF:'));
   const output: string[] = [];
@@ -104,12 +114,12 @@ function rewriteM3u8(text: string, base: URL, provider: Provider, streamflowId =
         const absolute = new URL(trimmed, base).toString();
         if (isMaster) {
           const track = pendingVariant ? `v${variantIndex++}` : `m${otherPlaylistIndex++}`;
-          output.push(proxied(provider, absolute, streamflowId, track));
+          output.push(proxied(provider, absolute, streamflowId, generation, track));
           pendingVariant = false;
         } else {
           const range = materializeRange(absolute, pendingRange);
           const objectId = `${inheritedTrack}--seg-${mediaSequence + segmentIndex}${rangeSuffix(range)}`;
-          output.push(proxied(provider, absolute, streamflowId, inheritedTrack, objectId));
+          output.push(proxied(provider, absolute, streamflowId, generation, inheritedTrack, objectId));
           segmentIndex += 1;
           pendingRange = null;
         }
@@ -123,7 +133,7 @@ function rewriteM3u8(text: string, base: URL, provider: Provider, streamflowId =
       if (!attrs.URI) { output.push(rawLine); continue; }
       const track = type === 'AUDIO' ? `a${audioIndex++}` : `m${otherPlaylistIndex++}`;
       output.push(rewriteUriAttribute(rawLine, uri => {
-        try { return proxied(provider, new URL(uri, base).toString(), streamflowId, track); }
+        try { return proxied(provider, new URL(uri, base).toString(), streamflowId, generation, track); }
         catch { return uri; }
       }));
       continue;
@@ -136,7 +146,7 @@ function rewriteM3u8(text: string, base: URL, provider: Provider, streamflowId =
           const absolute = new URL(uri, base).toString();
           const range = materializeRange(absolute, parseByteRange(attrs.BYTERANGE || ''));
           const objectId = `${inheritedTrack}--map-${mapIndex++}${rangeSuffix(range)}`;
-          return proxied(provider, absolute, streamflowId, inheritedTrack, objectId);
+          return proxied(provider, absolute, streamflowId, generation, inheritedTrack, objectId);
         } catch { return uri; }
       }));
       continue;
@@ -149,7 +159,7 @@ function rewriteM3u8(text: string, base: URL, provider: Provider, streamflowId =
       } else {
         const objectId = `${inheritedTrack}--key-${keyIndex++}`;
         output.push(rewriteUriAttribute(rawLine, uri => {
-          try { return proxied(provider, new URL(uri, base).toString(), streamflowId, inheritedTrack, objectId); }
+          try { return proxied(provider, new URL(uri, base).toString(), streamflowId, generation, inheritedTrack, objectId); }
           catch { return uri; }
         }));
       }
@@ -157,7 +167,7 @@ function rewriteM3u8(text: string, base: URL, provider: Provider, streamflowId =
     }
 
     output.push(rawLine.replace(/URI="([^"]+)"/g, (_all, uri) => {
-      try { return `URI="${proxied(provider, new URL(uri, base).toString(), streamflowId, inheritedTrack)}"`; }
+      try { return `URI="${proxied(provider, new URL(uri, base).toString(), streamflowId, generation, inheritedTrack)}"`; }
       catch { return `URI="${uri}"`; }
     }));
   }
@@ -177,7 +187,7 @@ async function fetchRedirectSafe(provider: Provider, url: URL, request: Request)
   let current = url;
   for (let i = 0; i < 4; i += 1) {
     assertMediaUrl(provider, current.toString());
-    const headers = new Headers({ Accept: '*/*', 'User-Agent': 'CactusTV/0.7', ...provider.requestHeaders });
+    const headers = new Headers({ Accept: '*/*', 'User-Agent': 'CactusTV/0.8', ...provider.requestHeaders });
     const range = request.headers.get('range');
     if (range) headers.set('range', range);
     const response = await fetchWithTimeout(current.toString(), { headers, redirect: 'manual' }, 15_000);
@@ -270,30 +280,10 @@ function mediaHeaders(upstream: Response, contentType: string): Headers {
   return headers;
 }
 
-async function streamflowHit(env: Env, sessionId: string, objectId: string): Promise<Response | null> {
-  if (!env.STREAMFLOW_R2 || !validStreamflowId(sessionId) || !validObjectId(objectId)) return null;
-  const object = await env.STREAMFLOW_R2.get(streamflowObjectKey(sessionId, objectId));
-  if (!object) return null;
-  const headers = new Headers();
-  object.writeHttpMetadata(headers);
-  headers.set('content-length', String(object.size));
-  headers.set('etag', object.httpEtag);
-  headers.set('access-control-allow-origin', '*');
-  headers.set('x-content-type-options', 'nosniff');
-  headers.set('x-cactus-streamflow', 'HIT');
-  headers.set('cache-control', 'private, max-age=31536000, immutable');
-  const range = object.customMetadata?.range || '';
-  const upstreamStatus = Number(object.customMetadata?.upstreamStatus || 200);
-  if (range) {
-    const [startRaw, lengthRaw] = range.split(':');
-    const start = Number(startRaw);
-    const length = Number(lengthRaw);
-    if (Number.isFinite(start) && Number.isFinite(length) && length > 0) {
-      headers.set('content-range', `bytes ${start}-${start + length - 1}/*`);
-      headers.set('accept-ranges', 'bytes');
-    }
-  }
-  return new Response(object.body, { status: upstreamStatus === 206 || range ? 206 : 200, headers });
+async function streamflowHit(request: Request, sessionId: string, objectId: string, generation: number): Promise<Response | null> {
+  if (!validStreamflowId(sessionId) || !validObjectId(objectId)) return null;
+  const origin = new URL(request.url).origin;
+  return matchStreamflowObject(origin, sessionId, objectId, generation, request.headers.get('range') || '');
 }
 
 export const onRequestGet: PagesFunction<Env, any, AppData> = async ({ request, env, waitUntil }) => {
@@ -303,9 +293,10 @@ export const onRequestGet: PagesFunction<Env, any, AppData> = async ({ request, 
   if (!provider || !provider.enabled || !provider.proxyEnabled) throw new HttpError(404, '该数据源未启用受控代理', 'PROXY_DISABLED');
 
   const streamflowId = params.get('sf') || '';
+  const generation = normalizeStreamflowGeneration(params.get('sfg'));
   const objectId = params.get('sfi') || '';
   if (streamflowId && objectId) {
-    const hit = await streamflowHit(env, streamflowId, objectId);
+    const hit = await streamflowHit(request, streamflowId, objectId, generation);
     if (hit) return hit;
   }
 
@@ -344,14 +335,15 @@ export const onRequestGet: PagesFunction<Env, any, AppData> = async ({ request, 
     if (bytes.byteLength > PLAYLIST_LIMIT) throw new HttpError(502, '播放列表过大', 'PLAYLIST_TOO_LARGE');
     const text = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
     const trackId = (params.get('sft') || 'main').replace(/[^a-zA-Z0-9._-]/g, '').slice(0, 40) || 'main';
-    if (env.DB && validStreamflowId(streamflowId) && /^(?:main|v\d+)$/.test(trackId)) {
-      waitUntil(ensureStreamflowSchema(env).then(() => env.DB!.prepare(`INSERT INTO streamflow_hints
-        (session_id, track_id, playlist_url, updated_at) VALUES (?, ?, ?, ?)
-        ON CONFLICT(session_id) DO UPDATE SET track_id = excluded.track_id,
-          playlist_url = excluded.playlist_url, updated_at = excluded.updated_at`)
-        .bind(streamflowId, trackId, finalUrl.toString(), Date.now()).run()).catch(() => {}));
+    const isMaster = text.split(/\r?\n/).some(line => line.trim().startsWith('#EXT-X-STREAM-INF:'));
+    if (!isMaster && validStreamflowId(streamflowId) && /^(?:main|v\d+)$/.test(trackId)) {
+      waitUntil(rememberStreamflowHint(requestUrl.origin, streamflowId, generation, {
+        provider: provider.id,
+        playlistUrl: finalUrl.toString(),
+        trackId,
+      }).catch(() => {}));
     }
-    return new Response(rewriteM3u8(text, finalUrl, provider, streamflowId, trackId), {
+    return new Response(rewriteM3u8(text, finalUrl, provider, streamflowId, generation, trackId), {
       headers: {
         'content-type': 'application/vnd.apple.mpegurl; charset=utf-8',
         'cache-control': 'private, max-age=10, stale-while-revalidate=20',
@@ -395,5 +387,16 @@ export const onRequestGet: PagesFunction<Env, any, AppData> = async ({ request, 
   if (streamflowId && objectId) headers.set('x-cactus-streamflow', 'MISS');
   if (!headers.get('content-type') || contentType.includes('text/plain')) headers.set('content-type', 'application/octet-stream');
   const body = prefix.byteLength ? combinedBody(prefix, rest) : rest;
-  return new Response(body, { status: upstream.status, headers });
+  const response = new Response(body, { status: upstream.status, headers });
+  if (validStreamflowId(streamflowId) && validObjectId(objectId)) {
+    waitUntil(storeStreamflowObject(
+      requestUrl.origin,
+      streamflowId,
+      objectId,
+      generation,
+      request.headers.get('range') || '',
+      response.clone(),
+    ).catch(error => console.warn('CactusStreamflow cache write failed', error)));
+  }
+  return response;
 };
