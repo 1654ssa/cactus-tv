@@ -1,309 +1,191 @@
 # CactusStreamflow 仙人掌流式缓存
 
-CactusStreamflow 是 Cactus TV 的 Cloudflare 云端滚动缓存层。
+CactusStreamflow v0.8.0 使用 **Cloudflare Cache API**。它不需要 R2、Queue、信用卡或额外 Worker，只依赖原来的 Cloudflare Pages、Pages Functions 和 D1。
 
-它不把视频下载到手机，也不会要求浏览器在后台继续运行。播放器把观看进度写入 D1，Pages 将缓存任务投递到 Queue，独立 Worker 从片源拉取 HLS 分片并写入 R2。下次播放相同影片、相同集数和相同线路时，`/api/stream` 会优先读取 R2，未命中才回源。
+## 它怎么工作
+
+播放 HLS 视频时，所有 m3u8、TS、M4S、初始化分片和密钥仍然经过 `/api/stream` 受控代理：
+
+```text
+播放器请求分片
+  ↓
+Pages Function 查询当前 Cloudflare 边缘节点缓存
+  ├─ 命中：直接返回缓存内容
+  └─ 未命中：访问片源，返回给播放器，并异步写入 Cache API
+```
+
+当观看位置达到总时长三分之一以后，浏览器每约 30 秒向 `/api/cache/heartbeat` 报告进度。Pages Function 会根据当前进度和“剩余时长的一半”计算目标区间，然后在一次请求允许的后台时间内，预取一小批尚未缓存的后续 HLS 对象。
+
+页面隐藏或退出时，会再尝试预取最多 12 个对象。Cloudflare 对 HTTP 请求的 `waitUntil()` 只有有限的后台执行时间，因此本版本不会声称退出后一定能下载完整个剩余区间。
+
+## 与旧 R2 版的区别
+
+| 项目 | Cache API 版 | 旧 R2 版 |
+|---|---|---|
+| 信用卡 | 不需要 | 通常需要开通 R2 |
+| 额外 Worker | 不需要 | 需要 |
+| Queue | 不需要 | 需要 |
+| 持久保存 | 不保证 | 可持久保存 |
+| 跨地区共享 | 不保证 | 可以 |
+| 退出后长时间下载 | 不支持 | 支持 |
+| 播放过的分片加速 | 支持 | 支持 |
+| 观看中预取 | 支持 | 支持 |
+| 容量统计 | 不支持 | 支持 |
+
+## 真实限制
+
+Cloudflare Cache API 是临时边缘缓存，不是对象存储：
+
+- 缓存只保存在处理当前请求的数据中心，不会自动复制到所有地区。
+- 换网络、换城市或被调度到另一个 Cloudflare 节点后，可能重新回源。
+- Cloudflare 可以随时淘汰不活跃对象，代码设置的 7 天 TTL 不是永久保存承诺。
+- Cache API 不能列出全部对象，因此无法准确显示占用容量或分片数量。
+- “重置边缘缓存”通过切换缓存代数实现；旧代数不再读取，旧对象由 Cloudflare 后续自动淘汰，并不是立即物理删除全球缓存。
+- 只有经过受控代理的 HLS 点播能获得完整 Streamflow 功能。
+
+## 支持范围
+
+支持：
+
+- HLS 点播 m3u8
+- 主清单和多清晰度子清单
+- TS 分片
+- fMP4 / M4S 分片
+- `EXT-X-MAP`
+- AES-128 密钥
+- HLS Byte Range
+- 无 `.m3u8` 后缀但内容实际为 HLS 的地址
+
+暂不进行智能预取：
+
+- DASH / MPD
+- 普通 MP4 的时间区间
+- 直播 HLS
+- DRM 视频
+- 未开启播放代理的数据源
+
+普通 MP4 和 DASH 仍可按原有播放器逻辑播放，只是不参与 CactusStreamflow 的 HLS 分片预取。
 
 ## 缓存规则
 
-- 观看时长低于影片总时长的三分之一：不缓存。
-- 达到三分之一后：从当前位置前约 24 秒开始，缓存“剩余时长的一半”。
-- 单个播放会话最多约 950 MiB，始终小于 1 GiB。
-- 全站默认最多约 5 GiB。
-- 再次观看并继续前进时：删除已经看完的旧视频分片，保留当前位置附近内容，再向后补齐新的滚动窗口。
-- 设置页可以关闭功能，也可以提交“清空所有 R2 缓存”任务。
-- 页面被直接关闭或浏览器被系统杀掉时，最后一次延迟 Queue 消息仍会在 Cloudflare 端判断是否需要开始缓存。
-
-## 能加速什么
-
-当前版本只缓存 **HLS 点播**：
-
-- `.m3u8` 或实际内容为 HLS 的地址
-- 带 `#EXT-X-ENDLIST` 的点播列表
-- TS 分片
-- fMP4 HLS、`EXT-X-MAP`
-- AES-128 密钥
-- HLS Byte Range
-- 主清单、多清晰度和独立音轨
-
-暂不缓存：
-
-- 直播 HLS
-- DASH/MPD
-- 普通 MP4 的任意时间区间
-- DRM、Widevine、FairPlay
-- 没有启用受控代理的数据源
-- Cloudflare 无法访问或媒体域名未加入白名单的片源
-
-R2 命中的部分通常会比重新请求远端片源更稳定，尤其适合慢源、跨境源和临时抖动的源。首次观看、未缓存区间和缓存任务尚未完成时仍然依赖原片源。
-
-## 组件
-
-```text
-浏览器播放器
-  ├─ 每 30 秒上报观看进度
-  └─ 请求 /api/stream
-          ├─ R2 命中：直接返回缓存分片
-          └─ R2 未命中：回源
-
-Pages Functions
-  ├─ D1 保存会话、窗口、分片索引和状态
-  └─ Queue producer 投递延迟/滚动任务
-
-CactusStreamflow Worker
-  ├─ Queue consumer
-  ├─ 解析 HLS 主清单和媒体清单
-  ├─ 下载目标分片到 R2
-  └─ 删除已看完分片并更新 D1
-```
-
-## Cloudflare 资源名称
-
-建议直接使用项目默认名称：
-
-```text
-D1:     cactus-tv-db
-R2:     cactus-streamflow-cache
-Queue:  cactus-streamflow-jobs
-Worker: cactus-streamflow
-```
-
-绑定名必须完全一致：
-
-```text
-Pages / Worker D1 binding:       DB
-Pages / Worker R2 binding:       STREAMFLOW_R2
-Pages / Worker Queue producer:   STREAMFLOW_QUEUE
-Queue consumer:                  cactus-streamflow Worker
-```
+- 当前播放位置不足总时长三分之一：不预取。
+- 达到三分之一：目标窗口从当前位置前约 18 秒开始，到“当前位置 + 剩余时长的一半”为止。
+- 播放中每次心跳最多尝试缓存约 7 个对象。
+- 暂停时最多尝试约 9 个对象。
+- 页面隐藏或退出时最多尝试约 12 个对象。
+- 实际播放请求本身也会把成功返回的分片写入边缘缓存。
+- 视频分片默认缓存 TTL 为 7 天；密钥默认 6 小时，但都可能被 Cloudflare提前淘汰。
 
 ## 部署
 
-### 1. 更新主站代码
+v0.8.0 不新增任何 Cloudflare 资源。
 
-把本版本全部文件覆盖到 GitHub 仓库并提交。原来的 Pages 项目仍然从 `public` 发布，`functions` 仍位于仓库根目录。
-
-### 2. 执行 D1 迁移
-
-在 `cactus-tv-db` 的 D1 Console 中执行：
+保留原有：
 
 ```text
-migrations/0003_streamflow.sql
+Cloudflare Pages
+D1 binding: DB
+ADMIN_TOKEN
+其他现有环境变量
 ```
 
-这会创建：
+不需要：
 
 ```text
-streamflow_sessions
-streamflow_objects
-streamflow_hints
-```
-
-重复执行不会清空已有数据。
-
-### 3. 创建 R2
-
-Cloudflare Dashboard：
-
-```text
-R2 Object Storage
-→ Create bucket
-→ cactus-streamflow-cache
-```
-
-不需要公开 Bucket，也不需要绑定自定义域名。
-
-### 4. 创建 Queue
-
-Cloudflare Dashboard：
-
-```text
-Workers & Pages
-→ Queues
-→ Create queue
-→ cactus-streamflow-jobs
-```
-
-一条 Queue 只能连接一个推送式 consumer。本项目的 consumer 是 `cactus-streamflow`。
-
-### 5. 给 Pages 添加绑定
-
-进入原来的 Cactus TV Pages 项目：
-
-```text
-Settings
-→ Bindings
-```
-
-保留原来的 D1：
-
-```text
-Type: D1 database
-Variable name: DB
-Database: cactus-tv-db
-```
-
-新增 R2：
-
-```text
-Type: R2 bucket
-Variable name: STREAMFLOW_R2
-Bucket: cactus-streamflow-cache
-```
-
-新增 Queue producer：
-
-```text
-Type: Queue producer
-Variable name: STREAMFLOW_QUEUE
-Queue: cactus-streamflow-jobs
-```
-
-生产环境必须添加。需要预览分支也能测试时，再给 Preview 添加相同绑定。保存后重新部署 Pages。
-
-### 6. 部署独立 Worker
-
-项目已经包含：
-
-```text
-streamflow-worker/src/index.ts
-streamflow-worker/wrangler.toml
-```
-
-打开 `streamflow-worker/wrangler.toml`，把：
-
-```text
-database_id = "替换为你的 D1 database_id"
-```
-
-改成 `cactus-tv-db` 详情页显示的真实 Database ID。
-
-在项目根目录执行：
-
-```bash
-npm install
-npm run streamflow:deploy
-```
-
-Wrangler 会部署 `cactus-streamflow`，并同时连接：
-
-```text
-DB
+R2 Bucket
 STREAMFLOW_R2
-STREAMFLOW_QUEUE producer
-cactus-streamflow-jobs consumer
+Queue
+STREAMFLOW_QUEUE
+streamflow-worker
+0003_streamflow.sql
 ```
 
-同一 Queue 不要再绑定第二个 consumer。
+从 v0.7.0 R2 版升级时：
 
-如果数据源只写在 Pages 的 `PROVIDERS_JSON`，而没有保存在 D1 的 `providers` 表中，还要把同一份 `PROVIDERS_JSON` 配到 CactusStreamflow Worker。通常直接在 `/admin.html` 管理数据源即可，不需要额外变量。
+1. 用 v0.8.0 文件覆盖仓库。
+2. 删除仓库里的 `streamflow-worker/`。
+3. 删除 `migrations/0003_streamflow.sql`。
+4. Cloudflare Pages 中可以删除 `STREAMFLOW_R2` 和 `STREAMFLOW_QUEUE` 绑定。
+5. 如果此前创建过 R2、Queue 或独立 Worker，可以在确认不再使用后自行删除。
+6. 保留原 D1 的 `DB` 绑定。
+7. 重新部署 Pages。
 
-### 7. 重新部署 Pages
+旧版已经创建的 `streamflow_sessions`、`streamflow_objects`、`streamflow_hints` 三张 D1 表不会影响 v0.8.0。需要清理时可以在 D1 Console 手动执行：
 
-R2 和 Queue 绑定保存后，重新部署最新 GitHub 提交。打开：
+```sql
+DROP TABLE IF EXISTS streamflow_objects;
+DROP TABLE IF EXISTS streamflow_hints;
+DROP TABLE IF EXISTS streamflow_sessions;
+```
+
+这一步不是必须的。
+
+## 数据源配置
+
+进入 `/admin.html`，编辑正在使用的数据源：
+
+1. 开启“播放代理”。
+2. 把实际 m3u8、分片和密钥所在的 CDN 域名加入媒体域名白名单。
+3. 域名只填写主机名，不写 `https://` 和路径。
+
+例如：
 
 ```text
-/api/health
+api.example.com
+vod-cdn.example.net
+segment.example-cdn.com
+```
+
+## 检查是否工作
+
+打开：
+
+```text
+https://你的域名/api/health
 ```
 
 应看到：
 
 ```json
-"streamflowReady": true
+{
+  "streamflowReady": true,
+  "streamflowEngine": "cache-api"
+}
 ```
 
-打开 Worker 的 `workers.dev` 地址，应看到：
-
-```json
-{"ok":true,"service":"CactusStreamflow","version":"0.1.0"}
-```
-
-## 使用与检查
-
-1. 确认数据源开启了“受控播放代理”。
-2. 播放一个 HLS 点播视频超过三分之一。
-3. 关闭播放器或网页。
-4. 等 Queue consumer 完成任务。
-5. 打开播放设置，查看“CactusStreamflow 仙人掌流式缓存”。
-
-状态可能显示：
-
-```text
-分析中
-缓存中
-已就绪
-达到单集上限
-失败
-清理中
-```
-
-浏览器开发者工具中，命中 R2 的分片响应会带：
-
-```text
-x-cactus-streamflow: HIT
-```
-
-未命中并回源时会带：
+播放同一影片、同一集和同一线路时，视频分片响应头可能出现：
 
 ```text
 x-cactus-streamflow: MISS
 ```
 
-## 默认限制
+表示本次从片源读取，并已尝试写入边缘缓存。
 
-在 `streamflow-worker/wrangler.toml` 中：
-
-```toml
-STREAMFLOW_MAX_HEIGHT = "1080"
-STREAMFLOW_MAX_BYTES = "996147200"
-STREAMFLOW_BATCH_OBJECTS = "7"
-STREAMFLOW_TOTAL_MAX_BYTES = "5000000000"
-```
-
-含义：
-
-- 后台默认最多缓存 1080p 变体。
-- 单会话上限 950 MiB。
-- 每条 Queue 消息最多处理 7 个对象，避免一次调用拉取过多分片。
-- 全站上限为 5 GB。
-
-不建议把单会话上限调到精确 1 GiB，播放列表、音轨、初始化分片和密钥也会占用少量空间。
-
-## 故障排查
-
-### 设置页显示“未绑定 R2、Queue 或 D1”
-
-检查 Pages 的三个绑定名：
+再次命中时：
 
 ```text
-DB
-STREAMFLOW_R2
-STREAMFLOW_QUEUE
+x-cactus-streamflow: HIT
 ```
 
-修改绑定后必须重新部署 Pages。
+## 重置缓存
 
-### 一直没有缓存
+设置页点击“重置边缘缓存”后，D1 中的 `streamflow_cache_generation` 会变成一个新的数值。之后生成的播放地址使用新代数，旧代数对象不再命中。
 
-依次确认：
+这等同于逻辑清空，优点是不需要知道缓存中有哪些对象，也不需要 R2 的对象列表功能。
 
-- 已观看超过总时长三分之一。
-- 视频是 HLS 点播，不是 MP4、DASH 或直播。
-- 数据源开启受控播放代理。
-- 媒体域名已加入该数据源的媒体白名单。
-- Queue 已连接 `cactus-streamflow` consumer。
-- Worker 与 Pages 绑定的是同一个 D1、R2 和 Queue。
+## 什么时候会明显加速
 
-### 状态显示失败
+提升最明显的情况：
 
-设置页会显示最近错误。常见原因：
+- 同一设备或同一地区第二次播放相同分片。
+- 原片源跨境或偶尔抖动。
+- 观看过程中预取速度高于实际播放消耗速度。
+- 片源地址 Token 改变，但影片、集数、线路和分片序号保持一致。
 
-- 分片域名未在白名单。
-- 上游签名过期。
-- m3u8 没有 `#EXT-X-ENDLIST`。
-- 上游禁止 Cloudflare Worker 访问。
-- 数据源请求依赖的 Header 没有配置到数据源。
+提升不明显的情况：
 
-### 清空后仍显示对象
-
-清空是 Queue 分批任务，不是浏览器同步删除。刷新状态即可；对象较多时需要多个 Queue 批次。
+- 第一次播放。
+- 经常切换网络、地区或 Cloudflare 节点。
+- Cloudflare 已淘汰缓存。
+- 片源每次生成完全不同的分片结构。
+- 视频不是 HLS 点播。

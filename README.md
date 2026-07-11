@@ -1,6 +1,6 @@
 # Cactus TV
 
-当前版本：**v0.7.0**
+当前版本：**v0.8.0**
 
 Cactus TV 是一个部署在 Cloudflare Pages 上的私人影视检索与播放前端。它提供首页推荐、聚合搜索、片源切换、HLS 播放、观看记录、字幕和管理后台，但**项目本身不内置、不提供、也不推荐任何影视数据源**。
 
@@ -32,7 +32,7 @@ TG频道 https://t.me/CactusFreeTv
 - 豆瓣海报代理、缓存与失败重试
 - 播放错误、接口错误和空状态提示
 - Cloudflare Cache API 搜索缓存与最多 5 路上游并发控制
-- CactusStreamflow 仙人掌流式缓存：观看超过三分之一后，由 Cloudflare Queue Worker 把后续 HLS 分片写入 R2
+- CactusStreamflow 仙人掌流式缓存：观看超过三分之一后，使用 Cloudflare Cache API 边看边缓存并预取后续 HLS 分片
 
 ### 管理后台
 
@@ -58,13 +58,12 @@ D1 数据库保存：
 - 观看历史
 - 播放进度
 - 播放偏好
-- CactusStreamflow 缓存会话、分片索引与状态
 
 ## 项目特色
 
 ### 轻量部署
 
-前端由 Cloudflare Pages 托管，API 使用 Pages Functions，配置数据使用 D1。CactusStreamflow 另外使用一个 Queue consumer Worker 和一个私有 R2 Bucket。主站仍可由 GitHub 提交触发 Pages 自动部署；缓存 Worker 需要单独部署一次。
+前端由 Cloudflare Pages 托管，API 使用 Pages Functions，配置数据使用 D1。CactusStreamflow 直接使用 Pages Functions 内置的 Cloudflare Cache API，不需要 R2、Queue、信用卡或独立 Worker，仍然保持 GitHub 提交后由 Pages 自动部署。
 
 ### 数据源与播放器分离
 
@@ -94,7 +93,6 @@ cactus-tv/
 │  └─ _shared/                鉴权、数据库、元数据和数据源工具
 ├─ migrations/                D1 初始化与升级脚本
 ├─ public/                    静态前端文件
-├─ streamflow-worker/         R2 后台缓存 Worker
 ├─ scripts/                   本地预检与部署烟雾测试
 ├─ .dev.vars.example          本地环境变量示例
 ├─ wrangler.toml.example      本地 Wrangler 配置示例
@@ -105,13 +103,13 @@ cactus-tv/
 
 ## CactusStreamflow
 
-本版本新增 **CactusStreamflow 仙人掌流式缓存**。它只缓存 HLS 点播，不把视频存到浏览器。具体规则、限制、R2/Queue/Worker 创建和绑定步骤见：
+本版本将 **CactusStreamflow 仙人掌流式缓存** 改为 Cloudflare Cache API 引擎。它只对经过受控代理的 HLS 点播进行边缘缓存与小批量预取，不把视频存到浏览器，也不需要 R2、Queue 或独立 Worker。
 
 ```text
 CACTUS_STREAMFLOW.md
 ```
 
-升级旧部署时不能只覆盖代码，还必须执行 `migrations/0003_streamflow.sql`，创建 R2、Queue，并部署 `streamflow-worker/`。
+从旧 R2 版升级时，删除 `streamflow-worker/`、`migrations/0003_streamflow.sql` 以及 Pages 的 `STREAMFLOW_R2`、`STREAMFLOW_QUEUE` 绑定即可；原来的 `DB` 绑定必须保留。
 
 ## 部署教程
 

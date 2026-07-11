@@ -1,8 +1,8 @@
 {
   "name": "cactus-tv",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "private": true,
-  "description": "Cactus TV with Cloudflare Pages, D1 and CactusStreamflow R2 rolling cache.",
+  "description": "Cactus TV with Cloudflare Pages, D1 and CactusStreamflow Cache API edge caching.",
   "scripts": {
     "dev": "wrangler pages dev public",
     "vendor": "node -e \"const fs=require('node:fs');fs.copyFileSync('node_modules/hls.js/dist/hls.min.js','public/vendor/hls.min.js');fs.copyFileSync('node_modules/dashjs/dist/legacy/umd/dash.all.min.js','public/vendor/dash.all.min.js');fs.copyFileSync('node_modules/dashjs/dist/legacy/umd/dash.all.min.js.LICENSE.txt','public/vendor/dash.all.min.js.LICENSE.txt')\"",
@@ -16,9 +16,7 @@
     "deploy": "wrangler pages deploy public --project-name cactus-tv",
     "build:legacy": "esbuild public/js/app.js --bundle --format=iife --target=es2016 --minify --outfile=public/js/app-legacy.js",
     "db:migrate:local": "wrangler d1 migrations apply cactus-tv-db --local",
-    "db:migrate:remote": "wrangler d1 migrations apply cactus-tv-db --remote",
-    "streamflow:check": "cd streamflow-worker && ../node_modules/.bin/wrangler deploy --dry-run --outdir .wrangler-dist",
-    "streamflow:deploy": "cd streamflow-worker && ../node_modules/.bin/wrangler deploy"
+    "db:migrate:remote": "wrangler d1 migrations apply cactus-tv-db --remote"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260701.0",

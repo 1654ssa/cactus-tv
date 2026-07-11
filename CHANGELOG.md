@@ -1,3 +1,14 @@
+## 0.8.0 CactusStreamflow Cache API
+
+- 删除 R2、Queue、独立缓存 Worker 和 `0003_streamflow.sql` 依赖。
+- CactusStreamflow 改用 Cloudflare Cache API，不需要信用卡或额外 Cloudflare 资源。
+- `/api/stream` 对 HLS 分片先查边缘缓存，未命中时回源并异步写入缓存。
+- 观看超过总时长三分之一后，每约 30 秒预取一小批后续 HLS 对象。
+- 页面隐藏或退出时最多再尝试预取 12 个对象，但不承诺完整下载剩余区间。
+- 支持主清单、多清晰度、AES-128、fMP4 初始化分片和 Byte Range 的稳定缓存键。
+- 设置页改为显示 Cache API 模式，并通过切换缓存代数实现逻辑清空。
+- 缓存是当前数据中心的临时缓存，容量不可统计，也不保证永久保存或跨地区命中。
+
 # Changelog
 
 ## 0.6.0

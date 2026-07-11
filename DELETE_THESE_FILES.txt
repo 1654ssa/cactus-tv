@@ -1,0 +1,12 @@
+升级到 v0.8.0 Cache API 版时，请从 GitHub 仓库删除：
+
+streamflow-worker/                 （整个文件夹）
+migrations/0003_streamflow.sql
+STREAMFLOW_UPGRADE_FILES.txt
+
+Cloudflare Pages 后台如果以前添加过以下绑定，也可以删除：
+
+STREAMFLOW_R2
+STREAMFLOW_QUEUE
+
+保留原来的 D1 绑定：DB

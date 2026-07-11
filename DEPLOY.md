@@ -686,22 +686,24 @@ package.json
 
 ---
 
-# v0.7.0 CactusStreamflow 升级
+# v0.8.0 CactusStreamflow Cache API 升级
 
-从旧版升级到 v0.7.0 后，原来的 Pages + D1 仍然保留，但必须额外添加 R2、Queue 和独立 Worker。只覆盖 GitHub 文件不会启用云端缓存。
+从旧版升级到 v0.8.0 后，仍然只需要原来的 Pages + D1。CactusStreamflow 已删除 R2、Queue 和独立 Worker 依赖。
 
-完整步骤请直接打开：
+完整说明：
 
 ```text
 CACTUS_STREAMFLOW.md
 ```
 
-最少需要完成：
+升级步骤：
 
-1. 在原 D1 中执行 `migrations/0003_streamflow.sql`。
-2. 创建 R2 Bucket：`cactus-streamflow-cache`。
-3. 创建 Queue：`cactus-streamflow-jobs`。
-4. 给 Pages 添加 `STREAMFLOW_R2` 和 `STREAMFLOW_QUEUE`，保留 `DB`。
-5. 修改 `streamflow-worker/wrangler.toml` 中的 D1 `database_id`。
-6. 执行 `npm install` 和 `npm run streamflow:deploy`。
-7. 重新部署 Pages，确认 `/api/health` 中 `streamflowReady` 为 `true`。
+1. 用 v0.8.0 文件覆盖 GitHub 仓库。
+2. 删除仓库里的 `streamflow-worker/`。
+3. 删除 `migrations/0003_streamflow.sql`。
+4. 在 Pages Settings → Bindings 中删除 `STREAMFLOW_R2` 和 `STREAMFLOW_QUEUE`（如果以前添加过）。
+5. 保留原来的 D1 `DB` 绑定。
+6. 不需要创建 R2，不需要创建 Queue，不需要单独部署 Worker。
+7. 重新部署 Pages，打开 `/api/health`，确认 `streamflowReady` 为 `true`、`streamflowEngine` 为 `cache-api`。
+
+旧 R2 版留下的三张 D1 表不会影响运行，是否删除均可。
