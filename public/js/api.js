@@ -98,7 +98,7 @@ export const api = {
   health: () => requestJson('/api/health', { cacheTtl: 5 * 60_000, timeout: 8_000 }),
   home: () => requestJson('/api/home', { cacheTtl: 30 * 60_000, timeout: 12_000 }),
   search: (query, signal) => requestJson(`/api/search?q=${encodeURIComponent(query)}`, {
-    cacheTtl: 5 * 60_000,
+    cacheTtl: 0,
     dedupe: false,
     signal,
     timeout: 20_000,
