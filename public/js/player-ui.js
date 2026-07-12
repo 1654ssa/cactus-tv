@@ -30,6 +30,11 @@ export function createPlayerUI({
   setQuality = () => false,
   setAudioTrack = () => false,
   setSubtitleTrack = () => false,
+  seek = (target, options = {}) => {
+    video.currentTime = target;
+    if (options.resume && video.paused) video.play().catch(() => {});
+    return target;
+  },
 }) {
   const ui = {
     controls: shell.querySelector('#playerControls'),
@@ -88,6 +93,12 @@ export function createPlayerUI({
   let lastDoubleTapZone = '';
   let doubleTapSeekTotal = 0;
   let doubleTapResetTimer = 0;
+  let lastSeekCommitAt = 0;
+  let lastSeekTarget = -1;
+  let lastSaneCurrentTime = 0;
+  let progressPointerActive = false;
+  let progressCommittedDuringPointer = false;
+  let lastProgressPointerCommitAt = 0;
   const coarsePointer = matchMedia('(pointer: coarse)');
   const finePointer = matchMedia('(hover: hover) and (pointer: fine)');
   const LONG_PRESS_MS = 420;
@@ -103,9 +114,29 @@ export function createPlayerUI({
   };
   const clampedCurrentTime = () => {
     const duration = effectiveDuration();
-    const current = Number.isFinite(video.currentTime) ? Math.max(0, video.currentTime) : 0;
-    return duration ? clamp(current, 0, duration) : current;
+    let current = Number.isFinite(video.currentTime) ? Math.max(0, video.currentTime) : lastSaneCurrentTime;
+    const ptsWrap = (2 ** 33) / 90000;
+    if (duration && current > duration + 30 && current > ptsWrap - 3 * 60 * 60) {
+      const unwrapped = current - ptsWrap;
+      if (unwrapped >= 0 && unwrapped <= duration + 30) current = unwrapped;
+    }
+    if (!duration && current > 12 * 60 * 60) return lastSaneCurrentTime;
+    current = duration ? clamp(current, 0, duration) : current;
+    if (Number.isFinite(current) && current <= 12 * 60 * 60) lastSaneCurrentTime = current;
+    return current;
   };
+
+  function commitSeek(value, options = {}) {
+    const duration = effectiveDuration();
+    if (!duration) return false;
+    const target = clamp(Number(value) || 0, 0, Math.max(0, duration - 0.5));
+    const now = performance.now();
+    if (Math.abs(target - lastSeekTarget) < 0.12 && now - lastSeekCommitAt < 280) return target;
+    lastSeekCommitAt = now;
+    lastSeekTarget = target;
+    const result = seek(target, { resume: options.resume ?? !video.paused, source: options.source || 'ui' });
+    return result === false ? false : target;
+  }
 
   const setIcon = (button, icon) => { if (button) button.innerHTML = svgIcon(icon); };
 
@@ -146,6 +177,7 @@ export function createPlayerUI({
   function setState(nextState) {
     state = nextState;
     shell.dataset.state = nextState;
+    if (nextState !== 'error') message.classList.add('hidden');
     const loading = ['loading', 'buffering', 'reconnecting', 'recovering'].includes(nextState);
     ui.loading.classList.toggle('hidden', !loading);
     ui.loadingText.textContent = nextState === 'reconnecting'
@@ -255,8 +287,9 @@ export function createPlayerUI({
   function seekBy(seconds) {
     const duration = effectiveDuration();
     if (!duration) return;
-    video.currentTime = clamp(clampedCurrentTime() + seconds, 0, duration);
-    showGesture({ label: seconds > 0 ? `快进 ${seconds} 秒` : `快退 ${Math.abs(seconds)} 秒`, detail: formatClock(video.currentTime) }, 700);
+    const target = clamp(clampedCurrentTime() + seconds, 0, duration);
+    commitSeek(target, { source: 'step' });
+    showGesture({ label: seconds > 0 ? `快进 ${seconds} 秒` : `快退 ${Math.abs(seconds)} 秒`, detail: formatClock(target) }, 700);
     showControls();
   }
 
@@ -437,7 +470,7 @@ export function createPlayerUI({
       else showGesture({ label: `恢复 ${session.previousRate}×`, detail: '长按倍速结束' }, 360, 'boost');
       suppressClickUntil = performance.now() + 450;
     } else if (session.mode === 'seek') {
-      if (!cancelled && Number.isFinite(session.previewTime)) video.currentTime = session.previewTime;
+      if (!cancelled && Number.isFinite(session.previewTime)) commitSeek(session.previewTime, { source: 'gesture' });
       if (cancelled) hideGesture(0);
       else showGesture({ label: '已定位', detail: `${formatClock(session.previewTime || 0)} / ${formatClock(effectiveDuration())}`, progress: (session.previewTime || 0) / Math.max(1, effectiveDuration() || 1) }, 460, 'seek');
       suppressClickUntil = performance.now() + 450;
@@ -591,7 +624,7 @@ export function createPlayerUI({
         lastDoubleTapZone = zone;
         clearTimeout(doubleTapResetTimer);
         doubleTapResetTimer = window.setTimeout(() => { doubleTapSeekTotal = 0; lastDoubleTapZone = ''; }, 820);
-        { const duration = effectiveDuration(); if (duration) video.currentTime = clamp(clampedCurrentTime() + (zone === 'left' ? -10 : 10), 0, duration); }
+        { const duration = effectiveDuration(); if (duration) commitSeek(clamp(clampedCurrentTime() + (zone === 'left' ? -10 : 10), 0, duration), { source: 'double-tap' }); }
         showGesture({ label: doubleTapSeekTotal > 0 ? `快进 ${doubleTapSeekTotal} 秒` : `快退 ${Math.abs(doubleTapSeekTotal)} 秒`, detail: formatClock(video.currentTime) }, 620);
         showControls();
       }
@@ -612,6 +645,7 @@ export function createPlayerUI({
     seekBy(event.clientX < bounds.left + bounds.width / 2 ? -10 : 10);
   });
 
+  ui.progress.addEventListener('pointerdown', () => { progressPointerActive = true; progressCommittedDuringPointer = false; });
   ui.progress.addEventListener('input', () => {
     scrubbing = true;
     const ratio = Number(ui.progress.value) / 1000;
@@ -619,12 +653,24 @@ export function createPlayerUI({
     ui.current.textContent = formatClock(effectiveDuration() * ratio);
     showControls(true);
   });
+  const commitProgressSeek = () => {
+    const duration = effectiveDuration();
+    if (duration) commitSeek(duration * Number(ui.progress.value) / 1000, { source: 'progress' });
+    scrubbing = false; showControls();
+  };
   ui.progress.addEventListener('change', () => {
-    { const duration = effectiveDuration(); if (duration) video.currentTime = duration * Number(ui.progress.value) / 1000; }
-    scrubbing = false;
-    showControls();
+    if (!progressPointerActive && performance.now() - lastProgressPointerCommitAt < 250) return;
+    commitProgressSeek();
+    if (progressPointerActive) progressCommittedDuringPointer = true;
   });
-  ui.progress.addEventListener('pointerup', () => { scrubbing = false; });
+  ui.progress.addEventListener('pointerup', () => {
+    if (!progressCommittedDuringPointer) commitProgressSeek();
+    lastProgressPointerCommitAt = performance.now(); progressPointerActive = false; progressCommittedDuringPointer = false;
+  });
+  ui.progress.addEventListener('pointercancel', () => { progressPointerActive = false; progressCommittedDuringPointer = false; scrubbing = false; });
+  ui.progress.addEventListener('keyup', event => {
+    if (['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) commitProgressSeek();
+  });
 
   ui.mute.addEventListener('click', () => {
     if (video.muted || video.volume === 0) applyVolume(video.volume > 0 ? video.volume : 0.7, { persist: true });
@@ -775,6 +821,11 @@ export function createPlayerUI({
     if (Number.isFinite(duration) && duration > 0) trustedDuration = duration;
     scheduleTimeUpdate();
   });
+  video.addEventListener('cactus:durationAnomaly', event => {
+    const duration = Number(event.detail?.trustedDuration || 0);
+    if (Number.isFinite(duration) && duration > 0 && duration <= 12 * 60 * 60) trustedDuration = duration;
+    scheduleTimeUpdate();
+  });
   video.addEventListener('progress', scheduleTimeUpdate);
   video.addEventListener('volumechange', updateVolume);
   video.addEventListener('ratechange', () => { ui.speed.value = String(video.playbackRate); });
@@ -809,10 +860,10 @@ export function createPlayerUI({
     }
   });
   video.addEventListener('cactus:error', event => {
+    if (event.detail?.recoverable !== false) { setState('recovering'); return; }
     setState('error');
     message.querySelector('span').textContent = event.detail.error?.message || '播放失败';
-    message.classList.remove('hidden');
-    showControls(true);
+    message.classList.remove('hidden'); showControls(true);
   });
 
   retryButton.addEventListener('click', () => retryHandler?.());
@@ -838,7 +889,7 @@ export function createPlayerUI({
       pointerSession = null; suppressClickUntil = 0;
       if (timeFrame) cancelAnimationFrame(timeFrame);
       finishGestureFrame();
-      timeFrame = 0; gestureFrame = 0; pendingGestureUpdate = null; lastTapTime = 0; lastTapZone = ''; lastDoubleTapAt = 0; lastDoubleTapZone = ''; doubleTapSeekTotal = 0; diagnosticsData = null; diagnosticsVisible = false; trustedDuration = 0;
+      timeFrame = 0; gestureFrame = 0; pendingGestureUpdate = null; lastTapTime = 0; lastTapZone = ''; lastDoubleTapAt = 0; lastDoubleTapZone = ''; doubleTapSeekTotal = 0; lastSeekCommitAt = 0; lastSeekTarget = -1; lastSaneCurrentTime = 0; progressPointerActive = false; progressCommittedDuringPointer = false; lastProgressPointerCommitAt = 0; diagnosticsData = null; diagnosticsVisible = false; trustedDuration = 0;
       setLocked(false);
       closeTools();
       message.classList.add('hidden');

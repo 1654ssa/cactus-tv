@@ -1,6 +1,6 @@
-import { api } from './api.js?v=1.2.8';
-import { store } from './storage.js?v=1.2.8';
-import { buildPersonalizedHome } from './recommend.js?v=1.2.8';
+import { api } from './api.js?v=1.3.0';
+import { store } from './storage.js?v=1.3.0';
+import { buildPersonalizedHome } from './recommend.js?v=1.3.0';
 
 const $ = selector => document.querySelector(selector);
 const els = {
@@ -42,6 +42,10 @@ function installDialogFallback(dialog) {
 const PAGE_SIZE = 24;
 const PLAYBACK_BUDGET_MS = 48_000;
 const PLAYBACK_MAX_ATTEMPTS = 7;
+const MPEG_TS_WRAP_SECONDS = (2 ** 33) / 90000;
+const MAX_REASONABLE_VOD_DURATION = 12 * 60 * 60;
+const RECOVERY_WINDOW_MS = 90_000;
+const MAX_SAME_CANDIDATE_RECOVERIES = 2;
 let currentView = 'home';
 let settings = store.settings();
 let featuredItem = null;
@@ -115,8 +119,8 @@ async function ensurePlayerModules() {
   if (playerApi && playerUI) return playerApi;
   if (!playerModulesPromise) {
     playerModulesPromise = Promise.all([
-      import('./player.js?v=1.2.8'),
-      import('./player-ui.js?v=1.2.8'),
+      import('./player.js?v=1.3.0'),
+      import('./player-ui.js?v=1.3.0'),
     ]).then(([apiModule, uiModule]) => {
       playerApi = apiModule;
       playerUI = uiModule.createPlayerUI({
@@ -128,6 +132,7 @@ async function ensurePlayerModules() {
         setQuality: apiModule.setPlaybackQuality,
         setAudioTrack: apiModule.setPlaybackAudioTrack,
         setSubtitleTrack: apiModule.setPlaybackSubtitleTrack,
+        seek: (target, options) => apiModule.seekStream(els.player, target, options),
       });
       if (!deviceProfile.saveData) apiModule.preloadPlayerEngine().catch(() => {});
       return apiModule;
@@ -1211,8 +1216,8 @@ function mediaSessionFor(candidate) {
     });
     navigator.mediaSession.setActionHandler('play', () => els.player.play());
     navigator.mediaSession.setActionHandler('pause', () => els.player.pause());
-    navigator.mediaSession.setActionHandler('seekbackward', event => { els.player.currentTime = Math.max(0, els.player.currentTime - (event.seekOffset || 10)); });
-    navigator.mediaSession.setActionHandler('seekforward', event => { const duration = playerDuration(); els.player.currentTime = duration ? Math.min(duration, playerPosition() + (event.seekOffset || 10)) : playerPosition() + (event.seekOffset || 10); });
+    navigator.mediaSession.setActionHandler('seekbackward', event => { seekPlayerTo(playerPosition() - (event.seekOffset || 10), { source: 'media-session' }); });
+    navigator.mediaSession.setActionHandler('seekforward', event => { seekPlayerTo(playerPosition() + (event.seekOffset || 10), { source: 'media-session' }); });
     navigator.mediaSession.setActionHandler('previoustrack', () => playRelativeEpisode(-1));
     navigator.mediaSession.setActionHandler('nexttrack', () => playRelativeEpisode(1));
   } catch {}
@@ -1220,22 +1225,50 @@ function mediaSessionFor(candidate) {
 
 
 
-function playerDuration() {
-  const trusted = Number(els.player.__cactusTrustedDuration || 0);
-  if (Number.isFinite(trusted) && trusted > 0) return trusted;
-  const nativeDuration = Number(els.player.duration || 0);
-  return Number.isFinite(nativeDuration) && nativeDuration > 0 && nativeDuration < 12 * 60 * 60 ? nativeDuration : 0;
+function saneDuration(value) {
+  const duration = Number(value || 0);
+  return Number.isFinite(duration) && duration > 0 && duration <= MAX_REASONABLE_VOD_DURATION ? duration : 0;
 }
 
-function clampPlayerPosition(value = 0) {
-  const duration = playerDuration();
-  const position = Math.max(0, Number(value) || 0);
-  return duration ? Math.min(position, Math.max(0, duration - 0.5)) : position;
+function playerDuration() {
+  return saneDuration(els.player.__cactusTrustedDuration) || saneDuration(els.player.duration);
+}
+
+function sanitizePlaybackPosition(value = 0, duration = playerDuration(), { fallback = 0, resetNearEnd = false } = {}) {
+  const safeDuration = saneDuration(duration);
+  let position = Math.max(0, Number(value) || 0);
+  if (safeDuration && position > safeDuration + 30 && position > MPEG_TS_WRAP_SECONDS - 3 * 60 * 60) {
+    const unwrapped = position - MPEG_TS_WRAP_SECONDS;
+    if (unwrapped >= 0 && unwrapped <= safeDuration + 30) position = unwrapped;
+  }
+  if (!safeDuration && position > MAX_REASONABLE_VOD_DURATION) {
+    const unwrapped = position - MPEG_TS_WRAP_SECONDS;
+    if (unwrapped >= 0 && unwrapped <= MAX_REASONABLE_VOD_DURATION) position = unwrapped;
+    else return Math.max(0, Number(fallback) || 0);
+  }
+  if (safeDuration) {
+    position = Math.min(position, Math.max(0, safeDuration - 0.5));
+    if (resetNearEnd && safeDuration > 120 && safeDuration - position < 45) return 0;
+  }
+  return position;
+}
+
+function clampPlayerPosition(value = 0, fallback = 0) {
+  return sanitizePlaybackPosition(value, playerDuration(), { fallback });
 }
 
 function playerPosition(fallback = 0) {
-  const current = Number.isFinite(els.player.currentTime) ? Math.max(0, els.player.currentTime) : NaN;
-  return clampPlayerPosition(Number.isFinite(current) ? current : fallback);
+  const current = Number(els.player.currentTime);
+  return sanitizePlaybackPosition(Number.isFinite(current) ? current : fallback, playerDuration(), { fallback });
+}
+
+function seekPlayerTo(value, options = {}) {
+  const target = clampPlayerPosition(value);
+  if (playerApi?.seekStream) return playerApi.seekStream(els.player, target, { resume: !els.player.paused, ...options });
+  try {
+    els.player.currentTime = target;
+    return target;
+  } catch { return false; }
 }
 
 function playerBufferAhead() {
@@ -1298,12 +1331,21 @@ async function startCandidate(playback, candidate, startAt) {
   }
 }
 
+function consumeSameCandidateRecovery(playback) {
+  const now = Date.now();
+  const recent = (playback.recoveryTimestamps || []).filter(value => now - Number(value || 0) < RECOVERY_WINDOW_MS);
+  if (recent.length >= MAX_SAME_CANDIDATE_RECOVERIES) {
+    playback.recoveryTimestamps = recent; playback.sameCandidateRecoveryCount = recent.length; return false;
+  }
+  recent.push(now); playback.recoveryTimestamps = recent; playback.sameCandidateRecoveryCount = recent.length; return true;
+}
+
 async function restartCurrentCandidate(playback, position, { disableClean = false, reason = null } = {}) {
   if (!playback || playback.recoveryInProgress || playback.sequence !== playbackSequence || !playback.currentCandidate) return false;
-  if (playback.sameCandidateRecoveryCount >= 1) return false;
+  if (!consumeSameCandidateRecovery(playback)) return false;
   playback.recoveryInProgress = true;
-  playback.sameCandidateRecoveryCount += 1;
-  playback.desiredPosition = Math.max(0, Number(position) || playback.lastStablePosition || 0);
+  const requested = Number(position);
+  playback.desiredPosition = sanitizePlaybackPosition(Number.isFinite(requested) ? requested : playback.lastStablePosition, playerDuration(), { fallback: playback.lastStablePosition || 0 });
   if (disableClean) playback.cleanStreamBypassed = true;
   const candidate = playback.currentCandidate;
   setPlaybackStatus(disableClean ? '检测到时间轴异常，已关闭本集实验性去广告并重建播放' : '正在从当前进度重建播放线路', 'switching');
@@ -1364,7 +1406,8 @@ async function openPlayer(detail, episode, options = {}) {
     (Number(historyItem.episodeIndex) === episodeIndex && Number(historyItem.lineIndex) === lineIndex)
     || episodeIdentity(historyItem.episodeName, Number(historyItem.episodeIndex || 0)) === episodeIdentity(episode.name, episodeIndex)
   );
-  const resumeAt = options.resumeAt ?? (settings.resumePlayback && sameEpisode ? Number(historyItem.position || 0) : 0);
+  const rawResumeAt = options.resumeAt ?? (settings.resumePlayback && sameEpisode ? Number(historyItem.position || 0) : 0);
+  const resumeAt = sanitizePlaybackPosition(rawResumeAt, saneDuration(historyItem?.duration), { resetNearEnd: true });
   els.resumeHint.textContent = resumeAt > 5 ? `将从 ${formatTime(resumeAt)} 继续` : '';
   if (!els.playerDialog.open) els.playerDialog.showModal();
   try {
@@ -1392,8 +1435,8 @@ async function openPlayer(detail, episode, options = {}) {
     successRecorded: false, prewarmedNext: '', lastStartupMs: 0,
     activePlayUrl: '', lastPlaybackPressureAt: Date.now(),
     desiredPosition: Math.max(0, Number(resumeAt) || 0),
-    lastStablePosition: Math.max(0, Number(resumeAt) || 0),
-    sameCandidateRecoveryCount: 0, recoveryInProgress: false, cleanStreamBypassed: false,
+    lastStablePosition: 0, hasConfirmedPosition: false,
+    sameCandidateRecoveryCount: 0, recoveryTimestamps: [], recoveryInProgress: false, cleanStreamBypassed: false, durationAnomalyHandled: false,
   };
   resetCandidatePool(currentPlayback);
   playerUI.setRetry(() => {
@@ -1411,18 +1454,15 @@ async function openPlayer(detail, episode, options = {}) {
   await attemptPlayback(resumeAt);
 }
 
-function saveHistory(position = playerPosition(), duration = playerDuration()) {
+function saveHistory(position, duration = playerDuration()) {
   if (!currentPlayback || !settings.recordHistory) return;
   const candidate = currentPlayback.currentCandidate;
   const episode = candidate?.episode || currentPlayback.episode;
-  const metadata = canonicalItem(
-    candidate?.detail,
-    currentPlayback.detail,
-    currentPlayback.baseDetail,
-    currentPlayback.item,
-    currentPlayback.sourceItem,
-  );
-  const record = {
+  const metadata = canonicalItem(candidate?.detail, currentPlayback.detail, currentPlayback.baseDetail, currentPlayback.item, currentPlayback.sourceItem);
+  const safeDuration = saneDuration(duration);
+  const preferredPosition = position ?? (currentPlayback.hasConfirmedPosition ? currentPlayback.lastStablePosition : currentPlayback.desiredPosition || playerPosition(0));
+  const safePosition = sanitizePlaybackPosition(preferredPosition, safeDuration, { fallback: currentPlayback.hasConfirmedPosition ? currentPlayback.lastStablePosition : currentPlayback.desiredPosition || 0 });
+  store.addHistory({
     ...metadata,
     provider: candidate?.detail?.provider || currentPlayback.detail.provider,
     providerName: candidate?.detail?.providerName || currentPlayback.detail.providerName,
@@ -1434,10 +1474,9 @@ function saveHistory(position = playerPosition(), duration = playerDuration()) {
     episodeIndex: candidate?.episodeIndex ?? currentPlayback.preferred.episodeIndex,
     sourceName: candidate?.providerName || candidate?.provider || '',
     url: candidate?.url || currentPlayback.playUrl || '',
-    position,
-    duration,
-  };
-  store.addHistory(record);
+    position: safePosition,
+    duration: safeDuration,
+  });
 }
 
 function relativeEpisode(delta) {
@@ -1697,7 +1736,10 @@ els.playerPrev.addEventListener('click', () => playRelativeEpisode(-1));
 els.playerNext.addEventListener('click', () => playRelativeEpisode(1));
 els.playerSwitchSource.addEventListener('click', () => {
   if (!currentPlayback) return;
-  const position = playerPosition(currentPlayback?.desiredPosition || currentPlayback?.lastStablePosition || 0);
+  const recentlySeeking = currentPlayback.lastPlaybackPressureAt && Date.now() - currentPlayback.lastPlaybackPressureAt < 10_000;
+  const position = clampPlayerPosition(recentlySeeking
+    ? currentPlayback.desiredPosition
+    : currentPlayback.lastStablePosition || currentPlayback.desiredPosition || 0);
   stopStream(els.player);
   attemptPlayback(position, { forceFailover: true, resetBudget: true, reason: new Error('手动切换线路') });
 });
@@ -1709,17 +1751,34 @@ els.nextEpisodeCancel.addEventListener('click', cancelNextEpisode);
 
 els.player.addEventListener('timeupdate', () => {
   if (!currentPlayback) return;
-  const position = playerPosition(currentPlayback.desiredPosition);
-  if (!els.player.seeking && position > 0) {
-    currentPlayback.desiredPosition = position;
-    currentPlayback.lastStablePosition = position;
-  }
+  const confirmed = currentPlayback.hasConfirmedPosition ? currentPlayback.lastStablePosition : 0;
   if (Date.now() - currentPlayback.lastSync >= 15000) {
     currentPlayback.lastSync = Date.now();
-    saveHistory(position, playerDuration());
+    saveHistory(confirmed || currentPlayback.desiredPosition, playerDuration());
   }
-  const remaining = playerDuration() - position;
+  const duration = playerDuration();
+  const remaining = duration - (confirmed || sanitizePlaybackPosition(currentPlayback.desiredPosition, duration));
   if (remaining > 0 && remaining < 90) prewarmNextEpisode();
+});
+els.player.addEventListener('cactus:position', event => {
+  if (!currentPlayback || !event.detail?.confirmed) return;
+  const position = clampPlayerPosition(event.detail.position);
+  currentPlayback.desiredPosition = position;
+  currentPlayback.lastStablePosition = position;
+  currentPlayback.hasConfirmedPosition = true;
+});
+els.player.addEventListener('cactus:seekTarget', event => {
+  if (!currentPlayback) return;
+  currentPlayback.desiredPosition = clampPlayerPosition(event.detail?.position || 0);
+  currentPlayback.lastPlaybackPressureAt = Date.now();
+});
+els.player.addEventListener('cactus:duration', () => {
+  if (!currentPlayback) return;
+  currentPlayback.desiredPosition = clampPlayerPosition(currentPlayback.desiredPosition, currentPlayback.lastStablePosition);
+  if (currentPlayback.hasConfirmedPosition) currentPlayback.lastStablePosition = clampPlayerPosition(currentPlayback.lastStablePosition);
+  els.resumeHint.textContent = currentPlayback.desiredPosition > 5
+    ? `将从 ${formatTime(currentPlayback.desiredPosition)} 继续`
+    : '';
 });
 els.player.addEventListener('seeked', () => {
   if (!currentPlayback || els.player.ended) return;
@@ -1742,7 +1801,7 @@ els.player.addEventListener('cactus:stable', () => {
   const playback = currentPlayback;
   const candidate = playback?.currentCandidate;
   if (!playback || !candidate) return;
-  playback.sameCandidateRecoveryCount = 0;
+  playback.stableSince = Date.now();
   if (!playback.successRecorded) {
     playback.successRecorded = true;
     store.recordSourceSuccess(candidate.provider, candidateHealthKey(candidate));
@@ -1757,21 +1816,45 @@ els.player.addEventListener('playing', () => {
   if (currentPlayback && playerBufferAhead() >= 18) currentPlayback.lastPlaybackPressureAt = 0;
 });
 
+els.player.addEventListener('cactus:durationAnomaly', event => {
+  const playback = currentPlayback;
+  if (!playback || playback.sequence !== playbackSequence) return;
+  const safePosition = sanitizePlaybackPosition(event.detail?.position ?? playback.lastStablePosition ?? playback.desiredPosition, saneDuration(event.detail?.trustedDuration), { fallback: playback.lastStablePosition || playback.desiredPosition || 0 });
+  playback.desiredPosition = safePosition;
+  if (playback.hasConfirmedPosition) playback.lastStablePosition = safePosition;
+  if (playback.durationAnomalyHandled) return;
+  playback.durationAnomalyHandled = true;
+  if (settings.cleanStreamEnabled !== false && !playback.cleanStreamBypassed && playback.currentCandidate) {
+    const error = new Error('检测到异常时间轴，正在关闭实验性去广告并重建');
+    error.code = 'TIMELINE_CORRUPTED'; error.position = safePosition;
+    restartCurrentCandidate(playback, safePosition, { disableClean: true, reason: error }).then(ok => {
+      if (ok || !currentPlayback || currentPlayback.sequence !== playbackSequence) return;
+      if (settings.autoFailover) attemptPlayback(safePosition, { reason: error, resetBudget: true });
+      else playerUI.showError(error);
+    });
+  }
+});
+
 els.player.addEventListener('cactus:error', event => {
   const playback = currentPlayback;
   if (!playback || playback.starting || playback.failureHandling || playback.recoveryInProgress || playback.sequence !== playbackSequence) return;
   const error = event.detail?.error || new Error('播放失败');
-  const requested = Number(error.position || playback.desiredPosition || playback.lastStablePosition || 0);
+  const errorPosition = Number(error.position);
+  const requested = Number.isFinite(errorPosition)
+    ? errorPosition
+    : Number(playback.desiredPosition || playback.lastStablePosition || 0);
   const position = clampPlayerPosition(requested);
   playback.desiredPosition = position;
   const candidate = playback.currentCandidate;
-  const recoverableVisualError = ['SEEK_FRAME_TIMEOUT', 'VIDEO_FRAME_FROZEN', 'TIMELINE_CORRUPTED'].includes(String(error.code || ''));
-  if (recoverableVisualError && candidate && playback.sameCandidateRecoveryCount < 1) {
+  const recoverableVisualError = event.detail?.recoverable !== false
+    && ['SEEK_FRAME_TIMEOUT', 'VIDEO_FRAME_FROZEN', 'TIMELINE_CORRUPTED'].includes(String(error.code || ''));
+  if (recoverableVisualError && candidate) {
     const disableClean = String(error.code || '') === 'TIMELINE_CORRUPTED' || (settings.cleanStreamEnabled !== false && !playback.cleanStreamBypassed);
     restartCurrentCandidate(playback, position, { disableClean, reason: error }).then(ok => {
       if (ok || !currentPlayback || currentPlayback.sequence !== playbackSequence) return;
       store.recordSourceFailure(candidate.provider, candidateHealthKey(candidate));
       if (settings.autoFailover) attemptPlayback(position, { reason: error, resetBudget: true });
+      else playerUI.showError(error);
     });
     return;
   }
