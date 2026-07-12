@@ -3,11 +3,11 @@ import { constants } from 'node:fs';
 
 const required = [
   'public/index.html', 'public/admin.html', 'public/styles.css', 'public/_headers', 'public/_redirects',
-  'public/js/app.js', 'public/js/app-legacy.js', 'public/js/admin.js', 'public/js/api.js', 'public/js/player.js', 'public/js/player-ui.js', 'public/js/recommend.js',
+  'public/js/app.js', 'public/js/app-legacy.js', 'public/js/admin.js', 'public/js/api.js', 'public/js/player.js', 'public/js/player-ui.js', 'public/js/recommend.js', 'public/js/cache-controls.js',
   'public/vendor/hls.min.js', 'public/vendor/dash.all.min.js', 'functions/_middleware.ts', 'functions/_shared/auth.ts',
-  'functions/api/health.ts', 'functions/api/stream.ts', 'functions/api/subtitle.ts', 'functions/api/library.ts',
+  'functions/api/health.ts', 'functions/api/stream.ts', 'functions/api/subtitle.ts', 'functions/api/library.ts', 'functions/api/browser-cache.ts',
   'functions/api/admin/providers.ts', 'migrations/0001_init.sql', 'migrations/0002_library.sql',
-  'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md',
+  'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'scripts/search-poster-test.mjs',
 ];
 
 const failures = [];
@@ -34,18 +34,40 @@ try {
 
 try {
   const html = await readFile('public/index.html', 'utf8');
-  for (const ref of ['/styles.css?v=1.3.1', '/js/app.js?v=1.3.1']) {
+  for (const ref of ['/styles.css?v=1.3.2', '/js/app.js?v=1.3.2', '/js/cache-controls.js?v=1.3.2']) {
     if (!html.includes(ref)) failures.push(`首页缺少或未升级资源引用：${ref}`);
   }
   if (/登录 Cactus TV|loginForm|authDialog/.test(html)) failures.push('首页仍包含登录界面');
   if (/CactusStreamflow|streamflowToggle|playerStreamflow/.test(html)) failures.push('首页仍包含已停用的 Streamflow 界面');
   if (!html.includes('cleanStreamToggle')) failures.push('首页缺少 Cactus Clean Stream 开关');
   if (!html.includes('recommendationToggle')) failures.push('首页缺少个性化推荐开关');
+  if (!html.includes('id="clearBrowserCache"')) failures.push('设置中缺少清除本地缓存按钮');
+} catch {}
+
+try {
+  const helper = await readFile('public/js/cache-controls.js', 'utf8');
+  for (const token of ['cactus:api:', 'window.caches', 'getRegistrations', '/api/browser-cache']) {
+    if (!helper.includes(token)) failures.push(`缓存清理脚本缺少：${token}`);
+  }
+  if (/localStorage\.(clear|removeItem)/.test(helper)) failures.push('缓存清理脚本不应删除本地片单、历史、设置或 D1 镜像');
+} catch {}
+
+try {
+  const cacheFunction = await readFile('functions/api/browser-cache.ts', 'utf8');
+  if (!cacheFunction.includes('Clear-Site-Data') || !cacheFunction.includes('"cache"')) failures.push('浏览器缓存接口必须仅清理 cache');
+  if (/DB|D1|library|history|favorites/i.test(cacheFunction)) failures.push('浏览器缓存接口不应访问 D1 或用户数据');
+} catch {}
+
+try {
+  const styles = await readFile('public/styles.css', 'utf8');
+  for (const token of ['v1.3.2 search-grid containment', 'repeat(3, minmax(0, 1fr))', '.settings-cache-button']) {
+    if (!styles.includes(token)) failures.push(`搜索布局/缓存按钮样式缺少：${token}`);
+  }
 } catch {}
 
 try {
   const app = await readFile('public/js/app.js', 'utf8');
-  for (const token of ['applyCleanStream', "import('./player.js?v=1.3.1')", "import('./player-ui.js?v=1.3.1')", 'buildPersonalizedHome']) {
+  for (const token of ['applyCleanStream', "import('./player.js?v=1.3.2')", "import('./player-ui.js?v=1.3.2')", 'buildPersonalizedHome']) {
     if (!app.includes(token)) failures.push(`前端主程序缺少：${token}`);
   }
   if (/sendStreamflowHeartbeat|prepareStreamflow|streamflowEnabled/.test(app)) failures.push('前端仍包含主动 Streamflow 逻辑');
@@ -69,6 +91,13 @@ try {
   const gestures = await readFile('public/js/player-ui.js', 'utf8');
   for (const token of ['GESTURE_THRESHOLD', 'AXIS_LOCK_RATIO', 'showTapRipple', 'requestAnimationFrame', 'effectiveDuration', 'cactus:duration']) {
     if (!gestures.includes(token)) failures.push(`手势引擎缺少：${token}`);
+  }
+} catch {}
+
+try {
+  const search = await readFile('functions/api/search.ts', 'utf8');
+  for (const token of ["cacheUrl.searchParams.set('v', '5')", 'doubanMatch?.poster', 'backfillSiblingPosters(enriched)', 'metadataYear || item.year']) {
+    if (!search.includes(token)) failures.push(`搜索封面修复缺少：${token}`);
   }
 } catch {}
 
